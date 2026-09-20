@@ -1,0 +1,105 @@
+# Gold-standard RBWS workbook layout reverse-engineered from
+# UBIT-GP_FVI_FWS_2024 manual Excel.
+
+sheet_name_from: facility
+
+header_row: 2
+data_start_row: 3
+
+columns:
+  - key: sn
+    header: "S/N"
+    excel_col: B
+    category: B
+  - key: insp_date
+    header: "Insp Date"
+    excel_col: C
+    category: A
+  - key: line_number
+    header: "Line #"
+    excel_col: D
+    category: A
+  - key: line_pressure_psi
+    header: "Line Pressure (Psi)"
+    excel_col: E
+    category: C
+  - key: line_description
+    header: "Line Description"
+    excel_col: F
+    category: A
+  - key: anomaly_description
+    header: "Anomaly Description"
+    excel_col: G
+    category: A
+  - key: pid_no
+    header: "P&ID No"
+    excel_col: H
+    category: A
+  - key: pof
+    header: "POF"
+    excel_col: I
+    category: C
+  - key: consq
+    header: "Consq"
+    excel_col: J
+    category: C
+  - key: driver
+    header: "Driver"
+    excel_col: K
+    category: C
+  - key: risk
+    header: "Risk"
+    excel_col: L
+    category: C
+  - key: iru
+    header: "IRU"
+    excel_col: M
+    category: C
+  - key: photos
+    header: "Photos"
+    excel_col: N
+    category: A
+    is_image: true
+  - key: iso
+    header: "ISO"
+    excel_col: O
+    category: A
+    is_image: true
+  - key: recommendations
+    header: "Quest  Recommendations"
+    excel_col: P
+    category: C
+  - key: remarks
+    header: "Remarks"
+    excel_col: Q
+    category: C
+
+# Fields intentionally left blank to match gold-standard engineering workflow.
+judgment_fields:
+  - line_pressure_psi
+  - pof
+  - consq
+  - driver
+  - risk
+  - iru
+  - recommendations
+  - remarks
+
+row_rules:
+  include_good_condition_cylinders: true
+  exclude_good_condition_piping: true
+  exclude_good_condition_untagged_lines: true
+  aggregate_pump_caisson_into_one_row: true
+  blank_pid_for_asset_classes:
+    - fire_protection_cylinder
+    - fire_water_pump_caisson
+
+good_condition_patterns:
+  - "(?i)visually\\s+in\\s+good\\s+condition"
+  - "(?i)in\\s+good\\s+condition"
+  - "(?i)visually\\s+good\\s+condition"
+
+pof_note: >
+  Note :As the actual condition cannot be clearly verified from some of the
+  available photograph, the Probability of Failure (PoF) has been assigned
+  based on the currently observable condition.

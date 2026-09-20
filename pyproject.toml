@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbws-fvi-extractor"
+version = "0.1.0"
+description = "Recreate manually prepared RBWS Excel workbooks from FVI inspection PDFs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pymupdf>=1.24.0",
+  "openai>=1.40.0",
+  "pandas>=2.2.0",
+  "openpyxl>=3.1.0",
+  "Pillow>=10.0.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.3.0",
+  "python-dotenv>=1.0.0",
+  "tqdm>=4.66.0",
+  "PyYAML>=6.0.0",
+  "tenacity>=8.3.0",
+  "streamlit>=1.36.0",
+  "pytesseract>=0.3.10",
+]
+
+[project.scripts]
+rbws-extractor = "rbws_extractor.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
