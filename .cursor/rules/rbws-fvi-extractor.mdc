@@ -1,142 +1,35 @@
 ---
-description: RBWS FVI→Excel extractor — how the local OCR/rules pipeline works and gold-standard row rules
+description: Local FVI PDF → RBWS Excel pipeline (no LLM). Row rules and code map.
 alwaysApply: true
 ---
 
-# RBWS FVI Extractor — Agent Guide
+# RBWS FVI Extractor
 
-You are working on **rbws-fvi-extractor**: recreate a manually prepared **RBWS Excel** from Jimcel/ExxonMobil (or SEPLAT) **Fire Water / FVI inspection PDFs**.
+Recreate gold-layout RBWS Excel from Jimcel FVI Fire Water PDFs. Local only: native text or Tesseract, then rules. Do not call LLMs.
 
-## Goal (source of truth)
+## Flow
 
-- **Input:** FVI PDF (image-only or native-text), same family as `UBIT-GP_FVI_FWS_*.pdf`, `YOHO-YA_FVI_FWS_*.pdf`
-- **Output:** Excel matching gold layout (e.g. sheet `UBIT-GP` / facility name), **not** a generic OCR dump
-- **Gold Excel** (when available) defines row rules — reverse-engineer from it, don’t invent columns
+PDF → render PNG → native text or OCR → `jimcel_native` or `ocr/parsers` → crop photos → `excel/writer`.
 
-## Default approach: local only (no API)
+CLI: `src/rbws_extractor/main.py` via `OcrPipeline`.
 
-**Preferred engine: `--engine ocr` (default).** No LLM / OpenAI / Gemini / NVIDIA required.
+## Rows
 
-Pipeline:
+- Master list = Visual Inspection Observation tables.
+- NOT APPLICABLE → zero rows.
+- One item = one row (do not row-per-photo).
+- Piping: Line # = tagged WF-…; full From–To; skip good-condition.
+- Equipment: Line # = Equipment Tag as written (`No Tag found` stays).
+- Pump/caisson: one aggregated row, or none if N/A.
+- Anomaly = table text + one photo range, not caption dumps.
+- Judgment columns always blank (pressure, POF, risk, recommendations, remarks).
 
-1. Render PDF pages → PNG (`PdfRenderer`)
-2. Prefer **native PDF text** if rich enough; else **Tesseract OCR**
-3. Parse with deterministic rules (`ocr/jimcel_native.py` for clean Jimcel tables; `ocr/parsers.py` OCR heuristics fallback)
-4. Apply gold **finding/row rules** (`pipeline/detect_findings.py`, `configs/rbws_columns.yaml`)
-5. Crop Photos/ISO from page renders (`ocr/crop.py`) and embed in Excel (`excel/writer.py`)
+## Fill vs blank
 
-Optional LLM path exists (`--engine llm`) but is **not** the default and was abandoned for quota/reliability; keep it secondary.
+Fill: S/N, Insp Date, Line #, Line Description, Anomaly Description, P&ID No, Photos.
 
-## Excel schema (header row 2, data from row 3, cols B–Q)
+P&ID: table/row value, not cover list. Blank for cylinders/pump only if that is the gold rule for that report family.
 
-| Col | Header | Category | Rule |
-|-----|--------|----------|------|
-| B | S/N | B | Sequential |
-| C | Insp Date | A | From metadata page; stamp all rows |
-| D | Line # | A | See asset rules below |
-| E | Line Pressure (Psi) | C | **Always blank** |
-| F | Line Description | A | From table / Equipment ID |
-| G | Anomaly Description | A | From captions/table/summary |
-| H | P&ID No | A | Blank for cylinders & pump/caisson |
-| I–M | POF, Consq, Driver, Risk, IRU | C | **Always blank** |
-| N | Photos | A | Cropped embedded image |
-| O | ISO | A | Sketch crop when applicable |
-| P–Q | Quest Recommendations, Remarks | C | **Always blank** (automation scope) |
+## Key files
 
-Category C = engineering judgment — leave blank unless user explicitly asks otherwise.
-
-## Report structure (Jimcel FVI template)
-
-Typical sections:
-
-- Cover / metadata TOC (facility, report #, WO, inspection date, cover P&IDs)
-- **§1** Summary of findings (bullets + Photo # ranges)
-- **§2** Visual inspection observation tables (piping, hose, monitor, diesel, cylinders)
-- **§3** Equipment anomaly photographic details (`Equipment ID` + Photo captions); may include ISO sketch (“DRAWING NOT TO SCALE”)
-- **§4** Lines found on P&ID with no line number (untagged), when present
-- Some sections marked **NOT APPLICABLE** → skip (no rows)
-
-**Note:** Cover/TOC P&IDs often differ from **row-level** P&IDs in §2 tables. Prefer table/row P&ID for findings.
-
-## Gold row-creation rules (critical)
-
-### Fire protection cylinders
-- **One §3 `Equipment ID` block = one Excel row** (include good-condition cylinders)
-- Line # = `Fire protection cylinder`
-- Line Description = Equipment ID text
-- P&ID = blank
-- Anomaly from Photo captions; keep Photo # refs in text when useful
-- ISO = none
-
-### Fire water pump & caisson
-- **Aggregate all pump/caisson evidence into ONE row**
-- Line # = `Fire water pump & caisson`
-- Line Description = blank; P&ID = blank
-- If section is NOT APPLICABLE → **no row**
-
-### Tagged piping (§2.3)
-- One table row = one Excel row
-- **Exclude** “Visually in good condition” (and similar)
-- Line # = tagged line (e.g. `WF-010-8"-40-FAA-4` or `WF-9024-2"-CBR-0`)
-- Keep P&ID from table
-- Photos + ISO when sketch pages match line number
-
-### Hose reel / monitor / diesel (§2.4–2.6)
-- Keep anomaly rows (usually “No tag found” for hose/monitor)
-- Diesel: Line # = equipment tag (e.g. `GP-G-03`); synthesize description if needed
-- Skip entire asset class if NOT APPLICABLE
-
-### Untagged lines (§4)
-- Like piping: exclude good-condition rows
-- Often different P&ID series (e.g. `…0050801`)
-
-### Photos / ISO images
-- Map finding `Photo #` refs → detail pages (§3+), **not** summary pages that only cite photo numbers
-- Crop photo grid region; if page has ISO sketch below photos, crop upper = Photos, lower = ISO
-- Stitch multiple photo pages vertically if needed
-- Cylinders / pump / diesel typically **no ISO**
-
-## Key code map
-
-| Path | Role |
-|------|------|
-| `src/rbws_extractor/main.py` | CLI (`--engine ocr\|llm`, `--pdf`, `--output`, `--work-dir`) |
-| `src/rbws_extractor/pipeline/ocr_pipeline.py` | Local end-to-end orchestrator |
-| `src/rbws_extractor/ocr/engine.py` | Render + native text / Tesseract |
-| `src/rbws_extractor/ocr/jimcel_native.py` | Native-text Jimcel table/Equipment parsers |
-| `src/rbws_extractor/ocr/parsers.py` | OCR heuristic parsers (UBIT-style image PDFs) |
-| `src/rbws_extractor/ocr/crop.py` | Photo#→page index + crops |
-| `src/rbws_extractor/pipeline/detect_findings.py` | Gold row assembly (LLM path / shared rules) |
-| `src/rbws_extractor/excel/writer.py` | Workbook + image embed |
-| `configs/rbws_columns.yaml` | Columns + judgment blanks + good-condition patterns |
-
-## How to run (local)
-
-```bash
-cd /Users/shivendrajaiswal/Developer/rbws-fvi-extractor
-source .venv/bin/activate
-PYTHONPATH=src python -m rbws_extractor.main \
-  --engine ocr \
-  --pdf /path/to/REPORT.pdf \
-  --output outputs/REPORT_RBWS.xlsx \
-  --work-dir outputs/report_run
-```
-
-Reuse existing page PNGs: `--reuse-pages outputs/.../pages`  
-Skip images: `--skip-images`
-
-## When given a new PDF
-
-1. Inspect page count + native text vs image-only
-2. Read metadata + §1–§2 tables + sample §3 Equipment ID pages
-3. Prefer `jimcel_native` if text is clean; else OCR path
-4. Honor NOT APPLICABLE sections
-5. Generalize line-number regexes (FAA-*, CBR-*, curly quotes `’`)
-6. Produce Excel with Photos/ISO; compare finding count/types to §1 summary totals
-7. Do **not** call external LLMs unless user explicitly requests `--engine llm`
-
-## Non-goals
-
-- Filling POF / recommendations / risk (judgment)
-- Generic full-document OCR dump without RBWS row semantics
-- Treating cover P&ID list as per-row P&ID
+`pipeline/ocr_pipeline.py`, `ocr/engine.py`, `ocr/jimcel_native.py`, `ocr/parsers.py`, `ocr/crop.py`, `excel/writer.py`, `configs/rbws_columns.yaml`
