@@ -54,24 +54,25 @@ PYTHONPATH=src python -m rbws_extractor.main \
   --work-dir outputs/report_run
 ```
 
-## Team UI (live)
+## Team UI
 
-The GitHub repo is: https://github.com/shivaiitr/rbws-fvi-extractor
+Streamlit app with **two workflows** (see `app.py`):
 
-That link is **source code**, not the running app. Teammates still need a Streamlit URL after you deploy (see [docs/DEPLOY.md](docs/DEPLOY.md)).
+| | Workflow A | Workflow B |
+|---|------------|------------|
+| Use for | Fire Water FVI (e.g. UBIT-GP) | Process Piping (e.g. EDOP-QP) |
+| Upload | One inspection PDF | Summary PDF + all line-number PDFs |
 
 Local:
 
 ```bash
 export PYTHONPATH=src
+export APP_PASSWORD='choose-a-password'
 streamlit run app.py
 ```
 
-To put it on a URL:
+Deploy: prefer **Railway** (Docker + Tesseract + large uploads). **Vercel is not suitable.** Steps in [docs/DEPLOY.md](docs/DEPLOY.md).
 
-1. This repo is already on GitHub.
-2. Open [share.streamlit.io](https://share.streamlit.io) → New app → this repo → main file `app.py`.
-3. Add secret `APP_PASSWORD` so random people cannot run reports.
-4. Share the `https://….streamlit.app` link + password with the team.
+GitHub: https://github.com/shivaiitr/rbws-fvi-extractor (source only — not the live URL).
 
-Do not host confidential inspection PDFs on a public app without a password and company approval. Uploaded PDFs are **not** stored in GitHub.
+Do not host confidential inspection PDFs on a public app without a password and company approval.

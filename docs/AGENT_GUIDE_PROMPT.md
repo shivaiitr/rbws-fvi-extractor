@@ -43,8 +43,9 @@ Cover P&IDs often differ from table P&IDs. Use the **table / row** P&ID.
 | Asset | Line # | Notes |
 |-------|--------|--------|
 | Piping | tagged `WF-…` | From–To in Line Description. Drop good-condition rows. |
-| Equipment (cyl / hose / monitor) | **Equipment Tag** as written, including `No Tag found` | Description from the observation table. |
-| Pump / caisson | one row `Fire water pump & caisson` | Skip if N/A. |
+| Cylinders | `Fire protection cylinder` | Line Description = Equipment ID / location. Include good-condition. |
+| Hose / monitor | **Equipment Tag** as written, including `No Tag found` | Description from the observation table / summary. |
+| Pump / caisson | `Fire water pump & caisson` | One aggregated row. Skip if N/A. |
 | Untagged §4 | as in table (`6" line`, etc.) | Drop good-condition. |
 
 One table item = one Excel row even if photos span many pages.

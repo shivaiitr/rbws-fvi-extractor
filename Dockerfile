@@ -12,6 +12,7 @@ COPY requirements.txt pyproject.toml ./
 COPY src ./src
 COPY configs ./configs
 COPY app.py ./
+COPY assets ./assets
 COPY .streamlit ./.streamlit
 
 RUN pip install --no-cache-dir -r requirements.txt pytesseract

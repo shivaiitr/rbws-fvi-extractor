@@ -15,8 +15,11 @@ from rbws_extractor.logging_config import get_logger
 logger = get_logger("ocr.pdf_photos")
 
 # Logos / headers are small; real inspection photos are larger.
+# Scanned PDFs often expose page tiles (~1275x205) — reject those by aspect.
 _MIN_W = 180
 _MIN_H = 140
+_MAX_ASPECT = 2.6  # width/height
+_MIN_ASPECT = 0.4
 
 
 def _caption_photo_nums_on_page(text: str) -> list[int]:
@@ -61,11 +64,16 @@ def extract_photo_map(
             text = (texts or {}).get(page_no) or (page.get_text("text") or "")
             caption_nums = _caption_photo_nums_on_page(text)
 
-            infos = [
-                im
-                for im in page.get_image_info(xrefs=True)
-                if im.get("width", 0) >= _MIN_W and im.get("height", 0) >= _MIN_H
-            ]
+            infos = []
+            for im in page.get_image_info(xrefs=True):
+                w = int(im.get("width", 0) or 0)
+                h = int(im.get("height", 0) or 0)
+                if w < _MIN_W or h < _MIN_H:
+                    continue
+                aspect = w / max(h, 1)
+                if aspect > _MAX_ASPECT or aspect < _MIN_ASPECT:
+                    continue
+                infos.append(im)
             # Reading order: top then left
             infos.sort(key=lambda im: (round(im["bbox"][1], 1), round(im["bbox"][0], 1)))
 

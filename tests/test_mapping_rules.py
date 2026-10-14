@@ -80,7 +80,7 @@ def test_detect_cylinders_include_good_condition():
         equipment_pages=[(page, blocks)],
     )
     assert len(findings) == 2
-    assert findings[0].line_number == "No Tag found"
+    assert findings[0].line_number == "Fire protection cylinder"
     assert findings[0].pid_no is None
     assert findings[1].is_good_condition is True
     assert findings[1].pof is None
@@ -137,7 +137,7 @@ def test_exclude_good_condition_piping_keep_hose_and_anomaly():
     lines = [f.line_number for f in findings]
     assert 'WF-010-8"-40-FAA-4' in lines
     assert 'WF-002-2"-40-FAA-4' not in lines
-    assert "No Tag found" in lines
+    assert "No tag found" in lines
 
 
 def test_pump_aggregated_single_row():
@@ -241,7 +241,7 @@ def test_equipment_tag_is_used_as_excel_line_number():
 
 def test_normalize_technical_identifier_removes_wrapped_breaks():
     assert normalize_technical_identifier("NGR1-AH-\nPDPID-0050809") == "NGR1-AH-PDPID-0050809"
-    assert normalize_technical_identifier("No Tag\nfound") == "No Tag found"
+    assert normalize_technical_identifier("No Tag\nfound") == "No tag found"
     assert normalize_technical_identifier("WF-9024-2''-\nCBR-0") == 'WF-9024-2"-CBR-0'
 
 

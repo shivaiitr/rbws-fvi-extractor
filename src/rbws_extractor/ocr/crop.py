@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from rbws_extractor.logging_config import get_logger
 from rbws_extractor.models.findings import AssetClass, Finding, PhotoRef
-from rbws_extractor.pipeline.detect_findings import _compress_photo_refs
+from rbws_extractor.pipeline.rules import compress_photo_refs as _compress_photo_refs
 
 logger = get_logger("ocr.crop")
 
@@ -31,7 +31,9 @@ def build_photo_page_index(texts: dict[int, str]) -> dict[int, list[int]]:
         is_detail = (
             "equipment id" in lower
             or "description of anomalies" in lower
-            or re.search(r"photo\s*#?\s*\d+\s*:", lower) is not None
+            or re.search(r"photo\s*#?\s*\d+\s*:?", lower) is not None
+            or "hose,reel" in lower.replace(" ", "")
+            or "hose reel" in lower
         )
         if page_no <= _SUMMARY_PAGE_MAX and not is_detail:
             continue
@@ -39,7 +41,45 @@ def build_photo_page_index(texts: dict[int, str]) -> dict[int, list[int]]:
             num = int(m.group(1))
             if page_no not in index[num]:
                 index[num].append(page_no)
+        # Ranges like "Photo #52 to 55" / "Photo #76-77"
+        for m in re.finditer(
+            r"(?i)Photo\s*#?\s*(\d+)\s*(?:[-–—to&]+|to)\s*(\d+)",
+            text,
+        ):
+            a, b = int(m.group(1)), int(m.group(2))
+            if b < a:
+                a, b = b, a
+            if b - a > 20:
+                continue
+            for num in range(a, b + 1):
+                if page_no not in index[num]:
+                    index[num].append(page_no)
     return dict(index)
+
+
+def _fill_photo_page_gaps(
+    photo_index: dict[int, list[int]], nums: list[int]
+) -> dict[int, list[int]]:
+    """Infer pages for Photo # gaps using neighboring known photo→page mappings."""
+    if not nums:
+        return photo_index
+    known = sorted((n, pages[0]) for n, pages in photo_index.items() if pages)
+    if len(known) < 2:
+        return photo_index
+    enriched = {k: list(v) for k, v in photo_index.items()}
+    for num in nums:
+        if enriched.get(num):
+            continue
+        prev = [pair for pair in known if pair[0] < num]
+        nxt = [pair for pair in known if pair[0] > num]
+        if prev and nxt:
+            page = int(round((prev[-1][1] + nxt[0][1]) / 2))
+            enriched.setdefault(num, []).append(page)
+        elif prev:
+            enriched.setdefault(num, []).append(prev[-1][1])
+        elif nxt:
+            enriched.setdefault(num, []).append(nxt[0][1])
+    return enriched
 
 
 def build_caption_index(texts: dict[int, str]) -> dict[int, str]:
@@ -69,6 +109,21 @@ def build_caption_index(texts: dict[int, str]) -> dict[int, str]:
     return captions
 
 
+def _is_iso_sketch_page(text: str) -> bool:
+    lower = text.lower()
+    if "drawing not to scale" in lower:
+        return True
+    # OCR often misses the stamp; LINE NUMBER + sketch legend is enough.
+    # Require a real sketch legend token (not the word "anomaly" alone — that
+    # appears on observation tables too).
+    has_line = re.search(r"(?i)(?:LINE|Jg?INE)\s*NUMBER\s*:", text) is not None
+    has_legend = re.search(
+        r"(?i)pipe\s*support|weld\s*joint|flow\s*direction|ref\.?\s*photo",
+        text,
+    ) is not None
+    return bool(has_line and has_legend)
+
+
 def build_iso_page_index(texts: dict[int, str]) -> list[tuple[int, str, str, list[int]]]:
     """
     ISO sketch pages: (page, line_hint, lower_text, ref_photo_nums).
@@ -77,21 +132,48 @@ def build_iso_page_index(texts: dict[int, str]) -> list[tuple[int, str, str, lis
     """
     rows: list[tuple[int, str, str, list[int]]] = []
     for page_no, text in texts.items():
-        lower = text.lower()
-        if "drawing not to scale" not in lower:
+        if not _is_iso_sketch_page(text):
             continue
+        lower = text.lower()
         line_hint = ""
-        m = re.search(r"(?i)LINE\s*NUMBER\s*:\s*(.+)", text)
+        m = re.search(r"(?i)(?:LINE|Jg?INE|INE)\s*NUMBER\s*:?\s*(.+)", text)
         if m:
             line_hint = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+        if not line_hint:
+            m = re.search(
+                r"(?i)((?:Fire\s*-?\s*Water\s+(?:Hose[,\s]*Reel|Monitor)|"
+                r"\d+[\"”″']?\s*LINE\s+from[^\n]{0,80}|WF-?[A-Z0-9\"”″'\-]+))",
+                text,
+            )
+            if m:
+                line_hint = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
         refs: list[int] = []
         for rm in re.finditer(
-            r"(?i)Ref\.?\s*Pht?oo?\s*#?\s*(\d+)\s*(?:[-–—to]+\s*(\d+))?",
+            r"(?i)Ref[.,]?\s*Photo\s*[*#]?\s*(\d+)\s*(?:[-–—to&]+|to)\s*(\d+)",
             text,
         ):
-            a = int(rm.group(1))
-            b = int(rm.group(2)) if rm.group(2) else a
-            refs.extend(range(a, b + 1))
+            a, b = int(rm.group(1)), int(rm.group(2))
+            if b < a:
+                a, b = b, a
+            if b - a <= 20:
+                refs.extend(range(a, b + 1))
+        for rm in re.finditer(
+            r"(?i)Ref[.,]?\s*Photo\s*[*#]?\s*(\d+)",
+            text,
+        ):
+            refs.append(int(rm.group(1)))
+        # Sketch pages also cite evidence as plain Photo # ranges.
+        for rm in re.finditer(
+            r"(?i)Photo\s*#?\s*(\d+)\s*(?:[-–—&to]+|to|&)\s*(\d+)",
+            text,
+        ):
+            a, b = int(rm.group(1)), int(rm.group(2))
+            if b < a:
+                a, b = b, a
+            if b - a <= 20:
+                refs.extend(range(a, b + 1))
+        for rm in re.finditer(r"(?i)Photo\s*#?\s*(\d+)", text):
+            refs.append(int(rm.group(1)))
         rows.append((page_no, line_hint, lower, sorted(set(refs))))
     return rows
 
@@ -406,41 +488,72 @@ def _match_iso_pages(
     Match by line number and/or Ref Photo # overlap. Multi-page sketches
     are all returned. Asset classes without ISO stay blank.
     """
+    # Gold leaves ISO blank for cylinders / pump / diesel only.
     if finding.asset_class in {
         AssetClass.FIRE_PROTECTION_CYLINDER,
         AssetClass.FIRE_WATER_PUMP_CAISSON,
         AssetClass.DIESEL_STORAGE_TANK,
-        AssetClass.FIRE_WATER_HOSE_REEL,
-        AssetClass.FIRE_WATER_MONITOR,
     }:
         return []
 
     line_compact = _norm_key(finding.line_number or "")
+    desc_compact = _norm_key(finding.line_description or "")
     photo_nums = set(_photo_numbers(finding))
     if (not line_compact or line_compact in {"notagfound"}) and not photo_nums:
         return []
 
     scored: list[tuple[int, int]] = []
     for page_no, line_hint, lower, ref_photos in iso_index:
-        if "drawing not to scale" not in lower:
+        # iso_index is already sketch-filtered; do not require the OCR stamp text.
+        # Skip early TOC / observation-table false positives (no sketch legend).
+        if page_no <= _SUMMARY_PAGE_MAX and "drawing not to scale" not in lower:
             continue
-        hint = _norm_key(line_hint)
+        hint = _norm_key(line_hint).replace("wef-", "wf-").replace("we-", "wf-")
         score = 0
         wf_parts = re.findall(r"wf-\d+", line_compact)
         if wf_parts and any(part in hint for part in wf_parts):
             score += 6
-        if line_compact[:14] and line_compact[:14] in hint:
+        if line_compact[:14] and line_compact[:14] in hint and line_compact not in {
+            "notagfound"
+        }:
             score += 5
         # Ref Photo callouts linking sketch → this finding's photos
         overlap = photo_nums.intersection(ref_photos)
         if overlap:
             score += 3 + min(3, len(overlap) // 2)
+            # Prefer real sketch pages over table pages that only mention Photo #.
+            if "drawing not to scale" in lower or "pipe support" in lower or "weld" in lower:
+                score += 2
         if finding.asset_class == AssetClass.UNTAGGED_LINE:
-            if line_compact.startswith("6") and "6" in hint:
+            if line_compact.startswith("6") and ("6" in hint or "6" in lower):
                 score += 4
-            if line_compact.startswith("8") and "8" in hint:
+            if line_compact.startswith("8") and ("8" in hint or "8" in lower):
                 score += 4
-        if score >= 4:
+        # Hose / monitor: Ref Photo overlap + location keywords on sketch page.
+        if finding.asset_class in {
+            AssetClass.FIRE_WATER_HOSE_REEL,
+            AssetClass.FIRE_WATER_MONITOR,
+        }:
+            if overlap:
+                score += 2
+            loc_hits = 0
+            hay = (hint + lower).replace("-", "").replace(" ", "").replace(",", "")
+            for token in (
+                "southeast",
+                "southwest",
+                "northeast",
+                "northwest",
+                "cellar",
+                "celler",
+                "maindeck",
+                "hosereel",
+                "hose",
+                "monitor",
+            ):
+                if token in desc_compact and token in hay:
+                    loc_hits += 1
+            score += min(4, loc_hits)
+        if score >= 3:
             scored.append((score, page_no))
 
     if not scored:
@@ -449,6 +562,90 @@ def _match_iso_pages(
     # Keep all pages within 2 of best score (multi-page ISO for one line)
     top = scored[0][0]
     return sorted({p for s, p in scored if s >= top - 2})
+
+
+def _photo_extracts_usable(photo_map: dict[int, Path], nums: list[int]) -> bool:
+    """Reject scanned-PDF strip/header extracts that are not real photos."""
+    paths = [photo_map[n] for n in nums if n in photo_map]
+    if not paths:
+        return False
+    ok = 0
+    for path in paths:
+        try:
+            with Image.open(path) as im:
+                w, h = im.size
+                if w < 160 or h < 120:
+                    continue
+                aspect = w / max(h, 1)
+                # Real inspection photos are roughly square/landscape; scanned
+                # page tiles are often very wide strips (~1275x205).
+                if aspect > 2.8 or aspect < 0.35:
+                    continue
+                sample = im.convert("L").resize((48, 48))
+                pixels = list(sample.getdata())
+                mean = sum(pixels) / len(pixels)
+                var = sum((p - mean) ** 2 for p in pixels) / len(pixels)
+                if mean > 245 and var < 400:
+                    continue
+                if var < 250:
+                    continue
+                ok += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return ok >= max(1, (len(paths) + 1) // 2)
+
+
+def _build_page_photo_crops(
+    *,
+    nums: list[int],
+    photo_index: dict[int, list[int]],
+    pages_dir: Path,
+    texts: dict[int, str],
+    pdf_path: Path | None,
+    photos_dir: Path,
+    sn: int,
+) -> list[Path]:
+    """Gold-style Photos: crop Equipment-ID + photo bands from rendered pages."""
+    page_nos = sorted({p for n in nums for p in photo_index.get(n, [])})
+    crops: list[Path] = []
+    for page_no in page_nos:
+        src = pages_dir / f"page_{page_no:03d}.png"
+        if not src.exists():
+            continue
+        with Image.open(src) as img:
+            bands = _layout_bands(
+                pdf_path, page_no, texts.get(page_no, ""), img.size
+            )
+            box = bands.get("photos")
+            if box is None:
+                # Fallback: keep header + photo body, drop footer noise.
+                w, h = img.size
+                box = (int(w * 0.03), int(h * 0.08), int(w * 0.97), int(h * 0.92))
+            cropped = _crop_box(img, box).convert("RGB")
+            tmp = photos_dir / f"sn_{sn:03d}_p{page_no:03d}.png"
+            cropped.save(tmp, format="PNG", optimize=True)
+            crops.append(tmp)
+    return crops
+
+
+def _finalize_photo_sheet(crops: list[Path], out: Path) -> Path:
+    """Compose one Excel Photos cell image from one or more page crops."""
+    if len(crops) == 1:
+        # Normalize to a landscape-friendly max size like gold media.
+        with Image.open(crops[0]) as im:
+            im = im.convert("RGB")
+            max_w, max_h = 1400, 900
+            scale = min(max_w / im.width, max_h / im.height, 1.0)
+            if scale < 1.0:
+                im = im.resize(
+                    (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            im.save(out, format="PNG", optimize=True)
+        return out
+    _stitch_vertical_professional(crops, out, max_h=1200)
+    return out
 
 
 def enrich_anomaly_from_captions(
@@ -566,12 +763,14 @@ def attach_images_from_ocr(
         nums = _photo_numbers(finding)
         finding.photos_image_path = None
         finding.iso_image_path = None
+        local_photo_index = _fill_photo_page_gaps(photo_index, nums)
 
-        # ---- Photos (all pages / all Photo # for this equipment) ----
+        # ---- Photos (gold-style page crops; collage only for real embeds) ----
         single_paths = [photo_map[n] for n in nums if n in photo_map]
         used_nums = [n for n in nums if n in photo_map]
         out = photos_dir / f"sn_{sn:03d}_photos.png"
-        if single_paths:
+        use_singles = bool(single_paths) and _photo_extracts_usable(photo_map, nums)
+        if use_singles:
             try:
                 _professional_photo_collage(
                     single_paths,
@@ -586,36 +785,25 @@ def attach_images_from_ocr(
                 logger.warning("Photo collage failed SN=%s: %s", sn, exc)
                 finding.photos_image_path = single_paths[0]
         else:
-            # Scanned PDF fallback: layout-aware photo-band crops across pages
-            page_nos = sorted(
-                {
-                    p
-                    for n in nums
-                    for p in photo_index.get(n, [])
-                }
+            # Scanned Jimcel PDFs: crop Equipment ID + photo bands from page renders
+            # (same visual structure as the gold workbook Photos column).
+            if single_paths and not use_singles:
+                logger.info(
+                    "SN=%s: ignoring unusable PDF photo extracts; using page crops",
+                    sn,
+                )
+            crops = _build_page_photo_crops(
+                nums=nums,
+                photo_index=local_photo_index,
+                pages_dir=pages_dir,
+                texts=texts,
+                pdf_path=pdf_path,
+                photos_dir=photos_dir,
+                sn=sn,
             )
-            crops: list[Path] = []
-            for page_no in page_nos:
-                src = pages_dir / f"page_{page_no:03d}.png"
-                if not src.exists():
-                    continue
-                with Image.open(src) as img:
-                    bands = _layout_bands(
-                        pdf_path, page_no, texts.get(page_no, ""), img.size
-                    )
-                    box = bands.get("photos")
-                    if box is None:
-                        continue
-                    cropped = _crop_box(img, box)
-                    tmp = photos_dir / f"sn_{sn:03d}_p{page_no:03d}.png"
-                    cropped.convert("RGB").save(tmp, format="PNG", optimize=True)
-                    crops.append(tmp)
-            if len(crops) == 1:
-                finding.photos_image_path = crops[0]
-            elif len(crops) > 1:
+            if crops:
                 try:
-                    _stitch_vertical_professional(crops, out)
-                    finding.photos_image_path = out
+                    finding.photos_image_path = _finalize_photo_sheet(crops, out)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Multi-page photo stitch failed SN=%s: %s", sn, exc)
                     finding.photos_image_path = crops[0]

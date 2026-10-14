@@ -66,6 +66,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override log level (DEBUG, INFO, WARNING, ERROR)",
     )
+    parser.add_argument(
+        "--edop-piping",
+        action="store_true",
+        help=(
+            "EDOP-QP process piping mode: --pdf is the summary report; "
+            "--line-pdf-dir holds per-line PDFs (JV Piping List S/N filenames)."
+        ),
+    )
+    parser.add_argument(
+        "--line-pdf-dir",
+        type=Path,
+        default=None,
+        help="Directory of per-line PDFs for --edop-piping (defaults to summary PDF dir)",
+    )
+    parser.add_argument(
+        "--max-lines",
+        type=int,
+        default=0,
+        help="Optional limit on line PDFs for --edop-piping (0 = all)",
+    )
     return parser
 
 
@@ -87,6 +107,39 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
     setup_logging(args.log_level or settings.log_level)
+
+    if args.edop_piping:
+        from rbws_extractor.excel.writer import RbwsExcelWriter
+        from rbws_extractor.ocr.edop_piping import build_edop_result
+
+        if not args.pdf or not args.pdf.exists():
+            print(f"ERROR: summary PDF not found: {args.pdf}", file=sys.stderr)
+            return 2
+        if not args.output:
+            print("ERROR: --output is required for --edop-piping", file=sys.stderr)
+            return 2
+        line_dir = args.line_pdf_dir or args.pdf.parent
+        if not line_dir.exists():
+            print(f"ERROR: line PDF directory not found: {line_dir}", file=sys.stderr)
+            return 2
+        result = build_edop_result(
+            summary_pdf=args.pdf,
+            line_pdf_dir=line_dir,
+            work_dir=args.work_dir,
+            max_lines=args.max_lines,
+        )
+        RbwsExcelWriter(settings.config_path).write(
+            result,
+            args.output,
+            embed_images=not args.skip_images,
+        )
+        print(
+            f"EDOP piping: {len(result.findings)} findings → {args.output} "
+            f"(warnings={len(result.warnings)})"
+        )
+        for warning in result.warnings:
+            print(f"  warning: {warning}")
+        return 0
 
     pipeline = OcrPipeline(settings)
 

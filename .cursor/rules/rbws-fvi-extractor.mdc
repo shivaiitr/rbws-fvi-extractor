@@ -19,8 +19,9 @@ CLI: `src/rbws_extractor/main.py` via `OcrPipeline`.
 - NOT APPLICABLE → zero rows.
 - One item = one row (do not row-per-photo).
 - Piping: Line # = tagged WF-…; full From–To; skip good-condition.
-- Equipment: Line # = Equipment Tag as written (`No Tag found` stays).
-- Pump/caisson: one aggregated row, or none if N/A.
+- Cylinders: Line # = `Fire protection cylinder`; Line Description = Equipment ID / location.
+- Hose/monitor: Line # = Equipment Tag as written (`No tag found` stays).
+- Pump/caisson: Line # = `Fire water pump & caisson`; one aggregated row, or none if N/A.
 - Anomaly = table text + one photo range, not caption dumps.
 - Judgment columns always blank (pressure, POF, risk, recommendations, remarks).
 
