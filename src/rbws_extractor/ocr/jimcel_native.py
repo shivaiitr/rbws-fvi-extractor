@@ -13,8 +13,8 @@ from rbws_extractor.models.findings import (
     PhotoRef,
     ReportMetadata,
 )
-from rbws_extractor.pipeline.detect_findings import _compress_photo_refs
 from rbws_extractor.pipeline.rules import (
+    compress_photo_refs as _compress_photo_refs,
     default_line_number_for_class,
     is_good_condition_text,
     normalize_whitespace,
@@ -490,7 +490,7 @@ def parse_hose_table(
         finding = Finding(
             asset_class=AssetClass.FIRE_WATER_HOSE_REEL,
             insp_date=metadata.inspection_date,
-            line_number="No Tag found",
+            line_number="No tag found",
             line_description=desc,
             anomaly_description=anomaly,
             pid_no=default_pid,

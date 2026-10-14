@@ -5,11 +5,14 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import yaml
 
 from rbws_extractor.config import DEFAULT_CONFIG
+
+if TYPE_CHECKING:
+    from rbws_extractor.models.findings import PhotoRef
 
 
 @lru_cache(maxsize=4)
@@ -53,7 +56,7 @@ def normalize_technical_identifier(value: str | None) -> str | None:
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
     text = text.replace("\"\"", '"')
-    text = re.sub(r"(?i)No\s+Tag\s+found", "No Tag found", text)
+    text = re.sub(r"(?i)No\s+Tag\s+found", "No tag found", text)
     text = re.sub(r"(?i)\bNGR1-AH-\s*PDPID-(\d{7})\b", r"NGR1-AH-PDPID-\1", text)
     text = re.sub(
         r'(?i)\bWF-(\d{1,5})-(\d{1,2})\s*["”″\']?\s*-\s*CBR-?(\d+)\b',
@@ -80,13 +83,29 @@ def join_from_to(from_text: str | None, to_text: str | None) -> str | None:
     return left or right
 
 
-def default_line_number_for_class(asset_class: str) -> str:
-    """Fallback only when no Equipment Tag value is present in the source PDF.
+def compress_photo_refs(refs: list["PhotoRef"]) -> list["PhotoRef"]:
+    """Collapse photo refs into a single contiguous start–end range."""
+    from rbws_extractor.models.findings import PhotoRef
 
-    Per the business rule, the Excel Line # must come from the PDF's Equipment Tag
-    field and must never be populated with the section or equipment type name.
+    if not refs:
+        return []
+    nums = sorted({n for ref in refs for n in range(ref.start, ref.end + 1)})
+    if not nums:
+        return []
+    return [PhotoRef(raw=f"{nums[0]:02d}-{nums[-1]:02d}", start=nums[0], end=nums[-1])]
+
+
+def default_line_number_for_class(asset_class: str) -> str:
+    """Fallback Line # when the observation table has no tagged line / equipment tag.
+
+    UBIT-GP gold uses the asset-class label for cylinders and pump/caisson.
+    Hose/monitor/other untagged equipment keep ``No tag found``.
     """
-    return "No Tag found"
+    if asset_class == "fire_protection_cylinder":
+        return "Fire protection cylinder"
+    if asset_class == "fire_water_pump_caisson":
+        return "Fire water pump & caisson"
+    return "No tag found"
 
 
 def should_blank_pid(asset_class: str, config: dict[str, Any] | None = None) -> bool:

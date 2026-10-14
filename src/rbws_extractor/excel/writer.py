@@ -10,6 +10,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
 
 from rbws_extractor.logging_config import get_logger
 from rbws_extractor.models.findings import ExtractionResult, Finding
@@ -37,7 +38,7 @@ HEADERS = [
     "Remarks",
 ]
 
-# Matched to gold UBIT workbook.
+# Photos / ISO columns sized for a clear engineer review viewport.
 GOLD_COL_WIDTHS = {
     "B": 9.1,
     "C": 10.5,
@@ -51,11 +52,20 @@ GOLD_COL_WIDTHS = {
     "K": 8.6,
     "L": 7.0,
     "M": 13.0,
-    "N": 35.8,
-    "O": 36.4,
+    "N": 48.0,  # Photos
+    "O": 48.0,  # ISO
     "P": 50.8,
     "Q": 27.9,
 }
+
+# openpyxl column letters for image embeds (1-based col index).
+_PHOTO_COL = 14  # N
+_ISO_COL = 15  # O
+
+# Soft caps so tall collages stay readable without burying the next row.
+_MIN_IMG_ROW_PT = 140.0
+_MAX_IMG_ROW_PT = 300.0
+_CELL_PAD_PX = 8
 
 THIN = Border(
     left=Side(style="thin", color="B0B0B0"),
@@ -94,6 +104,16 @@ def _finding_row_values(finding: Finding) -> list[Any]:
     ]
 
 
+def _col_width_to_px(width_chars: float) -> int:
+    """Approximate Excel column width (character units) → screen pixels."""
+    return max(40, int(width_chars * 7.0 + 5))
+
+
+def _px_to_row_points(height_px: int) -> float:
+    """Convert image pixel height to Excel row-height points (96 DPI)."""
+    return height_px * 72.0 / 96.0
+
+
 class RbwsExcelWriter:
     """Write ExtractionResult to an OpenPyXL workbook."""
 
@@ -123,6 +143,11 @@ class RbwsExcelWriter:
             cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
             cell.border = THIN
 
+        photo_max_w = _col_width_to_px(GOLD_COL_WIDTHS["N"]) - _CELL_PAD_PX
+        iso_max_w = _col_width_to_px(GOLD_COL_WIDTHS["O"]) - _CELL_PAD_PX
+        # First-pass height budget for fitting; row is resized to the fitted image.
+        fit_budget_h = int(_MAX_IMG_ROW_PT * 96.0 / 72.0) - _CELL_PAD_PX
+
         data_start = 3
         for offset, finding in enumerate(result.findings):
             row_idx = data_start + offset
@@ -132,25 +157,44 @@ class RbwsExcelWriter:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
                 cell.font = Font(name="Calibri", size=10)
                 cell.border = THIN
-                # Date format for Insp Date
                 if col_offset == 1 and value is not None:
-                    cell.number_format = "YYYY-MM-DD"
+                    cell.number_format = "mmm-yy"
 
-            # Gold uses ~150pt rows for image-bearing findings.
-            has_img = bool(
-                embed_images
-                and (finding.photos_image_path or finding.iso_image_path)
-            )
-            n_photos = sum(ref.end - ref.start + 1 for ref in finding.photo_refs) or 2
-            if has_img:
-                # Grow slightly for multi-photo collages, stay near gold.
-                ws.row_dimensions[row_idx].height = min(220, max(150, 110 + n_photos * 8))
-            else:
-                ws.row_dimensions[row_idx].height = 60
-
+            display_heights: list[float] = []
             if embed_images:
-                self._embed_image(ws, row_idx, col=14, path=finding.photos_image_path)
-                self._embed_image(ws, row_idx, col=15, path=finding.iso_image_path)
+                ph = self._embed_image(
+                    ws,
+                    row_idx,
+                    col=_PHOTO_COL,
+                    path=finding.photos_image_path,
+                    max_w=photo_max_w,
+                    max_h=fit_budget_h,
+                )
+                ih = self._embed_image(
+                    ws,
+                    row_idx,
+                    col=_ISO_COL,
+                    path=finding.iso_image_path,
+                    max_w=iso_max_w,
+                    max_h=fit_budget_h,
+                )
+                if ph:
+                    display_heights.append(ph)
+                if ih:
+                    display_heights.append(ih)
+
+            if display_heights:
+                # Size the row to the taller fitted image so Photos/ISO never
+                # spill into the next finding.
+                needed = max(display_heights) + 10.0
+                ws.row_dimensions[row_idx].height = min(
+                    _MAX_IMG_ROW_PT, max(_MIN_IMG_ROW_PT, needed)
+                )
+            else:
+                # Text-only / no-data rows stay compact.
+                text = finding.anomaly_description or ""
+                lines = max(2, text.count("\n") + 1)
+                ws.row_dimensions[row_idx].height = min(120.0, 36.0 + lines * 14.0)
 
         if include_pof_note:
             note_row = data_start + len(result.findings) + 2
@@ -175,21 +219,49 @@ class RbwsExcelWriter:
         return output_path
 
     @staticmethod
-    def _embed_image(ws, row_idx: int, col: int, path: Path | None) -> None:
+    def _embed_image(
+        ws,
+        row_idx: int,
+        col: int,
+        path: Path | None,
+        *,
+        max_w: int,
+        max_h: int,
+    ) -> float | None:
+        """Embed an image fitted inside the cell box. Returns display height in points."""
         if path is None or not Path(path).exists():
-            return
+            return None
         try:
-            img = XLImage(str(path))
-            # Professional cell fit (gold-like): readable, not oversized.
-            max_w, max_h = 260, 155
-            if img.width and img.height:
-                scale = min(max_w / img.width, max_h / img.height, 1.0)
-                img.width = max(1, int(img.width * scale))
-                img.height = max(1, int(img.height * scale))
+            src = Path(path)
+            with PILImage.open(src) as im:
+                im = im.convert("RGB")
+                # Letterbox onto a white canvas at the target cell aspect so the
+                # engineer always sees a clean, non-cropped contact sheet.
+                scale = min(max_w / max(im.width, 1), max_h / max(im.height, 1), 1.0)
+                new_w = max(1, int(im.width * scale))
+                new_h = max(1, int(im.height * scale))
+                if scale < 1.0:
+                    im = im.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+                else:
+                    new_w, new_h = im.width, im.height
+
+                canvas = PILImage.new("RGB", (max_w, max(new_h, 1)), (255, 255, 255))
+                x = (max_w - new_w) // 2
+                canvas.paste(im, (x, 0))
+                fitted = src.with_name(f"{src.stem}_cell{src.suffix}")
+                canvas.save(fitted, format="PNG", optimize=True)
+                display_h_px = canvas.height
+
+            img = XLImage(str(fitted))
+            # Lock Excel display size to the fitted pixel box (prevents blow-up).
+            img.width = max_w
+            img.height = display_h_px
             img.anchor = f"{get_column_letter(col)}{row_idx}"
             ws.add_image(img)
+            return _px_to_row_points(display_h_px)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed embedding image %s at %s: %s", path, row_idx, exc)
+            return None
 
     @staticmethod
     def _set_column_widths(ws) -> None:

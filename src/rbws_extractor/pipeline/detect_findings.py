@@ -14,6 +14,7 @@ from rbws_extractor.models.findings import (
     ReportMetadata,
 )
 from rbws_extractor.pipeline.rules import (
+    compress_photo_refs as _compress_photo_refs,
     default_line_number_for_class,
     is_good_condition_text,
     load_rbws_config,
@@ -54,15 +55,6 @@ def _anomaly_from_captions(block: EquipmentBlock) -> str:
     if len(lines) == 1:
         return lines[0].lstrip("-")
     return "\n".join(lines)
-
-
-def _compress_photo_refs(refs: list[PhotoRef]) -> list[PhotoRef]:
-    if not refs:
-        return []
-    nums = sorted({n for ref in refs for n in range(ref.start, ref.end + 1)})
-    if not nums:
-        return []
-    return [PhotoRef(raw=f"{nums[0]:02d}-{nums[-1]:02d}", start=nums[0], end=nums[-1])]
 
 
 def findings_from_cylinder_blocks(
@@ -263,7 +255,7 @@ def findings_from_observation_tables(
                 )
                 continue
 
-            line_number = normalize_technical_identifier(row.line_number) or "No Tag found"
+            line_number = normalize_technical_identifier(row.line_number) or "No tag found"
             line_description = normalize_whitespace(row.line_description)
             pid_no = normalize_technical_identifier(row.pid_no)
             if should_blank_pid(asset_class.value, cfg):

@@ -1,15 +1,18 @@
-"""Pipeline package.
+"""Pipeline package. Local OCR path is OcrPipeline."""
 
-Import submodules directly, e.g.:
-`from rbws_extractor.pipeline.orchestrator import RbwsPipeline`
-"""
+from __future__ import annotations
 
-__all__ = ["RbwsPipeline"]
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rbws_extractor.pipeline.ocr_pipeline import OcrPipeline
+
+__all__ = ["OcrPipeline"]
 
 
 def __getattr__(name: str):
-    if name == "RbwsPipeline":
-        from rbws_extractor.pipeline.orchestrator import RbwsPipeline
+    if name == "OcrPipeline":
+        from rbws_extractor.pipeline.ocr_pipeline import OcrPipeline
 
-        return RbwsPipeline
+        return OcrPipeline
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

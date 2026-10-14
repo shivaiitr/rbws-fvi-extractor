@@ -10,6 +10,7 @@ tqdm>=4.66.0
 PyYAML>=6.0.0
 tenacity>=8.3.0
 streamlit>=1.36.0
+pytesseract>=0.3.10
 
 # Dev / test
 pytest>=8.0.0

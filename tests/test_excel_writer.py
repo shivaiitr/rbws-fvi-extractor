@@ -48,4 +48,5 @@ def test_excel_writer_headers_and_blank_judgment(tmp_path: Path):
     assert ws.cell(3, 4).value == 'WF-010-8"-40-FAA-4'
     assert ws.cell(3, 9).value is None  # POF blank
     assert ws.cell(3, 16).value is None  # recommendations blank
+    assert ws.cell(3, 3).number_format == "mmm-yy"
     assert len(ws._images) == 1
