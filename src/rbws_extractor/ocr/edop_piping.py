@@ -94,6 +94,7 @@ class SummaryRow:
 class LinePdfParse:
     sn: int | None = None
     line_number: str | None = None
+    line_description: str | None = None
     pid_no: str | None = None
     anomaly_header: str | None = None
     caption_bullets: list[str] = field(default_factory=list)
@@ -102,6 +103,41 @@ class LinePdfParse:
     iso_path: Path | None = None
     has_photos: bool = False
     source_pdf: Path | None = None
+
+
+def detect_pdf_kind(pdf_path: Path) -> str:
+    """Classify an uploaded PDF for routing (fire water vs process piping)."""
+    pdf_path = Path(pdf_path)
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    try:
+        sample = "\n".join(
+            doc[i].get_text("text") or "" for i in range(min(4, doc.page_count))
+        )
+    finally:
+        doc.close()
+    name_u = pdf_path.name.upper()
+    text_u = sample.upper()
+    if "VISUAL INSPECTION OBSERVATIONS CHECKLIST" in text_u:
+        return "process_piping_summary"
+    if "SUMMARY" in name_u and "PIPING" in text_u:
+        return "process_piping_summary"
+    if re.search(
+        r"(?i)JV\s*Piping\s*List|DESCRIPTION OF ANOMALIES|Piping\s*list\s*s/?n",
+        sample,
+    ):
+        return "process_piping_line"
+    if re.search(
+        r"(?i)FIRE\s*WATER|HOSE\s*REEL|FIRE\s*PROTECTION\s*CYLINDER|"
+        r"FIRE\s*WATER\s*PUMP|UBIT-GP|YOHO",
+        sample,
+    ):
+        return "fire_water"
+    if "PROCESS PIPING" in text_u or "FULL VISUAL INSPECTION" in text_u:
+        return "process_piping_unknown"
+    return "unknown"
 
 
 def _col_for_x(x: float) -> str:
@@ -184,18 +220,41 @@ def parse_summary_metadata(doc: fitz.Document) -> ReportMetadata:
 
 
 def _assemble_pid(parts: list[str]) -> str | None:
+    """Build P&ID, keeping multi-drawing suffixes like ``…0017591/92`` or ``…/96/97/99``."""
     raw = re.sub(r"\s+", "", "".join(parts)).upper()
     if not raw:
         return None
-    # Normalize to NGQP-EP-PDPID-####### when possible
-    m = re.search(r"(NGQP-EP-)?(PDPID-)?(\d{5,})", raw)
+    # Primary drawing number + optional /NN or /NNN slash suffixes from the checklist.
+    m = re.search(
+        r"(?:NGQP-EP-)?(?:PDPID-)?(\d{5,})((?:/\d{2,4})+)?",
+        raw,
+    )
     if m:
-        return f"NGQP-EP-PDPID-{m.group(3)}"
+        suffix = m.group(2) or ""
+        return f"NGQP-EP-PDPID-{m.group(1)}{suffix}"
     if "QP-PR" in raw:
-        m = re.search(r"(QP-PR-?\d+)", raw)
+        m = re.search(r"(QP-PR-?\d+(?:/\d+)*)", raw)
         if m:
             return m.group(1)
     return raw
+
+
+def _prefer_pid(*candidates: str | None) -> str | None:
+    """Prefer the fullest P&ID (keep slash suffixes when present)."""
+    best: str | None = None
+    best_score = -1
+    for raw in candidates:
+        if not raw or not str(raw).strip():
+            continue
+        text = re.sub(r"\s+", "", str(raw)).strip()
+        # Re-normalize through assembler when it looks like a PDPID family value.
+        assembled = _assemble_pid([text]) if re.search(r"(?i)PDPID|\d{5,}", text) else text
+        value = assembled or text
+        score = len(value) + (10 if "/" in value else 0)
+        if score > best_score:
+            best = value
+            best_score = score
+    return best
 
 
 def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
@@ -206,12 +265,19 @@ def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
     """
     by_sn: dict[int, dict[str, list[tuple[float, float, str]]]] = {}
 
+    # Start once we see a checklist / SN table header — not EDOP-only wording.
+    _CHECKLIST_START = re.compile(
+        r"(?i)VISUAL\s+INSPECTION\s+OBSERVATIONS?\s+CHECKLIST|"
+        r"OBSERVATIONS?\s+CHECKLIST|"
+        r"S/?N\s+P\s*&?\s*ID\s+No|"
+        r"Line\s*Number.{0,40}From.{0,20}To"
+    )
     started = False
     for page_index in range(doc.page_count):
         page = doc[page_index]
         text = page.get_text("text") or ""
         if not started:
-            if "VISUAL INSPECTION OBSERVATIONS CHECKLIST" not in text.upper():
+            if not _CHECKLIST_START.search(text):
                 continue
             started = True
         if re.search(r"(?i)prepared\s+by|verified\s+by", text) and page_index > 20:
@@ -251,7 +317,8 @@ def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
             if y < 85:  # banner / report title band
                 continue
             if re.search(
-                r"(?i)^page$|EDOP-QP|PROCESS|FULL|VISUAL|INSPECTION|REPORT|QP/FVI",
+                r"(?i)^page$|EDOP-QP|EAP-GN|UBIT|YOHO|PROCESS|FULL|VISUAL|"
+                r"INSPECTION|REPORT|QP/FVI|FVI",
                 token,
             ):
                 continue
@@ -298,47 +365,265 @@ def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
     return rows
 
 
-def _extract_photos_from_page(
-    doc: fitz.Document,
-    page_index: int,
+_SHOT_ZOOM = 2.0
+
+
+def _classify_page(text: str) -> str:
+    """Hard-gate: mixed_page | iso_page | photo_page | other."""
+    lower = text.lower()
+    has_drawing = "drawing not to scale" in lower
+    anomaly_views = bool(
+        re.search(r"(?i)(?:General|Close|Further|Sectional)\s+view", text)
+    )
+    # Parenthetical view captions — not "Ref: photo #" callouts on sketches.
+    view_photo_n = len(re.findall(r"(?i)\(\s*Photo\s*#\s*\d+", text))
+    ref_photo_n = len(re.findall(r"(?i)Ref\.?\s*:?\s*photo\s*#", text))
+    has_line_meta = bool(re.search(r"(?i)LINE\s*NUMBER\s*:", text))
+    has_legend = bool(
+        re.search(
+            r"(?i)pipe\s*support|weld\s*joint|flow\s*direction|corroded\s*areas",
+            text,
+        )
+    )
+    has_equipment = bool(
+        re.search(r"(?i)description of anomalies|equipment\s*id|anomaly description", text)
+    )
+    has_iso_signal = has_drawing or (has_line_meta and ref_photo_n > 0) or (
+        has_line_meta and has_legend
+    )
+    has_anomaly_signal = anomaly_views or view_photo_n >= 1
+
+    # Anomaly photos + ISO sketch on the same page → split both ways.
+    if has_iso_signal and has_anomaly_signal:
+        return "mixed_page"
+    if has_drawing and (has_line_meta or has_legend or ref_photo_n > 0) and not anomaly_views:
+        return "iso_page"
+    if has_drawing and not anomaly_views and view_photo_n == 0:
+        return "iso_page"
+    if has_line_meta and ref_photo_n > 0 and not anomaly_views and not has_equipment:
+        return "iso_page"
+    if has_line_meta and has_legend and not anomaly_views and not has_equipment:
+        return "iso_page"
+    if has_anomaly_signal or has_equipment:
+        return "photo_page"
+    return "other"
+
+
+def _mixed_band_fracs(page: fitz.Page) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return ((photo_y0, photo_y1), (iso_y0, iso_y1)) as page-height fractions."""
+    page_h = float(page.rect.height) or 1.0
+    photo_ys: list[float] = []
+    iso_ys: list[float] = []
+    for winfo in page.get_text("words") or []:
+        token = (winfo[4] or "").strip()
+        y0 = float(winfo[1]) / page_h
+        low = token.lower()
+        if re.search(r"(?i)^photo$|^#\d+", token) or re.search(
+            r"(?i)general|close|further|sectional", token
+        ):
+            photo_ys.append(y0)
+        if re.search(r"(?i)^drawing$|^line$|^number$|^ref$", token) or "scale" in low:
+            iso_ys.append(y0)
+        if re.search(r"(?i)^prepared$|^verified$|^reviewed$|^approved$", token):
+            iso_ys.append(y0)
+
+    text = page.get_text("text") or ""
+    # Stronger anchors via full-text word positions already collected; fallbacks:
+    if not photo_ys and re.search(r"(?i)\(\s*Photo\s*#", text):
+        photo_ys = [0.15, 0.45]
+    if not iso_ys and (
+        "drawing not to scale" in text.lower()
+        or re.search(r"(?i)LINE\s*NUMBER\s*:", text)
+    ):
+        iso_ys = [0.55, 0.75]
+
+    if photo_ys and iso_ys:
+        photo_mid = sum(photo_ys) / len(photo_ys)
+        iso_mid = sum(iso_ys) / len(iso_ys)
+        if photo_mid < iso_mid:
+            split = (max(photo_ys) + min(iso_ys)) / 2.0
+            return (0.10, min(0.92, split)), (max(0.08, split), 0.88)
+        split = (max(iso_ys) + min(photo_ys)) / 2.0
+        return (max(0.08, split), 0.92), (0.08, min(0.88, split))
+    if photo_ys and not iso_ys:
+        return (0.10, 0.88), (0.50, 0.88)
+    if iso_ys and not photo_ys:
+        return (0.10, 0.45), (0.12, 0.88)
+    return (0.10, 0.48), (0.48, 0.88)
+
+
+def _collage_cols(n: int) -> int:
+    """1–3 comfortable; 4–10 and >10 always 4 columns (4×N)."""
+    if n <= 0:
+        return 1
+    if n <= 3:
+        return n
+    return 4
+
+
+def _is_field_photo_crop(img: Image.Image) -> bool:
+    """Keep inspection photo crops; drop logos, stamps, near-blank tiles."""
+    w, h = img.size
+    if w < 120 or h < 100:
+        return False
+    aspect = w / max(h, 1)
+    if aspect > 3.4 or aspect < 0.32:
+        return False
+    sample = img.convert("L").resize((64, 64))
+    vals = list(sample.getdata())
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return var >= 160.0
+
+
+def _render_page_shot(page: fitz.Page, zoom: float = _SHOT_ZOOM) -> Image.Image:
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+
+def _crop_photos_from_shot(
+    page: fitz.Page,
+    shot: Image.Image,
+    *,
+    zoom: float,
     out_dir: Path,
     stem: str,
+    page_index: int,
+    y_band: tuple[float, float] | None = None,
 ) -> list[Path]:
-    page = doc[page_index]
-    page_h = float(page.rect.height)
+    """Crop each field photo tile from a page screenshot (original pixels)."""
+    page_h = float(page.rect.height) or 1.0
+    page_w = float(page.rect.width) or 1.0
+    sw, sh = shot.size
+    y_lo, y_hi = y_band if y_band is not None else (0.10, 0.90)
     infos = page.get_image_info(xrefs=True)
     infos.sort(key=lambda im: (round(im["bbox"][1], 1), round(im["bbox"][0], 1)))
-    paths: list[Path] = []
-    seen_xref: set[int] = set()
-    for i, im in enumerate(infos):
-        w, h = int(im.get("width", 0)), int(im.get("height", 0))
-        if w < _MIN_PHOTO_PX_W or h < _MIN_PHOTO_PX_H:
-            continue
+
+    slots: dict[tuple[int, int], tuple[float, float, float, Image.Image]] = {}
+    for im in infos:
         bbox = im["bbox"]
         bw = float(bbox[2] - bbox[0])
         bh = float(bbox[3] - bbox[1])
         if bw < _MIN_PAGE_W or bh < _MIN_PAGE_H:
             continue
-        # Skip header logos / footer signature stamps
-        if bbox[1] < page_h * 0.12:
+        cy_frac = ((bbox[1] + bbox[3]) / 2.0) / page_h
+        if cy_frac < y_lo or cy_frac > y_hi:
             continue
-        if bbox[3] > page_h * 0.92:
+        if bbox[1] < page_h * 0.08:
             continue
-        xref = im.get("xref")
-        if not xref or xref in seen_xref:
+        if bbox[3] > page_h * 0.94:
             continue
-        seen_xref.add(xref)
-        try:
-            pix = fitz.Pixmap(doc, xref)
-            if pix.n >= 5:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
-            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        except Exception:  # noqa: BLE001
+        if bw < page_w * 0.16 or bh < page_h * 0.09:
             continue
+        # Map PDF points → screenshot pixels
+        x0 = max(0, int(bbox[0] * zoom) - 2)
+        y0 = max(0, int(bbox[1] * zoom) - 2)
+        x1 = min(sw, int(bbox[2] * zoom) + 2)
+        y1 = min(sh, int(bbox[3] * zoom) + 2)
+        if x1 - x0 < 80 or y1 - y0 < 60:
+            continue
+        crop = shot.crop((x0, y0, x1, y1))
+        if not _is_field_photo_crop(crop):
+            continue
+        cx = int(((bbox[0] + bbox[2]) / 2.0) / 36.0)
+        cy = int(((bbox[1] + bbox[3]) / 2.0) / 36.0)
+        area = bw * bh
+        key = (cx, cy)
+        prev = slots.get(key)
+        if prev is None or area > prev[0]:
+            slots[key] = (area, float(bbox[1]), float(bbox[0]), crop)
+
+    ordered = sorted(slots.values(), key=lambda t: (t[1], t[2]))
+    paths: list[Path] = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, (_area, _y, _x, crop) in enumerate(ordered):
         out = out_dir / f"{stem}_p{page_index + 1:02d}_img{i + 1:02d}.png"
-        img.save(out, format="PNG", optimize=True)
+        crop.save(out, format="PNG", optimize=True)
         paths.append(out)
     return paths
+
+
+def _assign_photo_numbers(
+    n_tiles: int,
+    caption_by_num: dict[int, str],
+    photo_refs: list[PhotoRef],
+) -> list[int]:
+    """Assign Photo # labels in reading order without cross-page duplicates."""
+    if n_tiles <= 0:
+        return []
+    from_refs: list[int] = []
+    for ref in photo_refs:
+        for n in range(ref.start, ref.end + 1):
+            if n not in from_refs:
+                from_refs.append(n)
+    if len(from_refs) == n_tiles:
+        return from_refs
+    from_caps = sorted(caption_by_num.keys())
+    if len(from_caps) == n_tiles:
+        return from_caps
+    # Prefer caption/ref numbers for the leading tiles; fill the rest sequentially.
+    base = from_refs or from_caps
+    if not base:
+        return list(range(1, n_tiles + 1))
+    out = list(base[:n_tiles])
+    nxt = (max(out) if out else 0) + 1
+    while len(out) < n_tiles:
+        out.append(nxt)
+        nxt += 1
+    return out
+
+
+def _crop_iso_from_shot(
+    page: fitz.Page,
+    shot: Image.Image,
+    out: Path,
+    *,
+    y_band: tuple[float, float] | None = None,
+    allow_mixed: bool = False,
+) -> Path | None:
+    """Crop isometric sketch only — never include anomaly photo tiles."""
+    text = page.get_text("text") or ""
+    kind = _classify_page(text)
+    if kind not in {"iso_page", "mixed_page"}:
+        return None
+    if kind == "mixed_page" and not allow_mixed:
+        return None
+
+    w, h = shot.size
+    page_h = float(page.rect.height) or 1.0
+    if y_band is not None:
+        y_top_frac, y_bot_frac = y_band
+    else:
+        y_top_frac = 0.14
+        y_bot_frac = 0.78
+        line_meta_y: float | None = None
+        for winfo in page.get_text("words") or []:
+            token = (winfo[4] or "").strip()
+            y0 = float(winfo[1]) / page_h
+            if re.fullmatch(r"(?i)LINE", token):
+                line_meta_y = y0 if line_meta_y is None else min(line_meta_y, y0)
+            if re.search(r"(?i)^Prepared|^Verified|^Reviewed|^Approved", token):
+                y_bot_frac = min(y_bot_frac, max(0.55, y0 - 0.01))
+            if re.search(r"(?i)^Drawing$", token):
+                y_bot_frac = max(y_bot_frac, min(0.88, y0 + 0.08))
+        if line_meta_y is not None:
+            y_top_frac = max(0.05, min(0.22, line_meta_y - 0.01))
+
+    y_top_frac = max(0.04, min(0.85, y_top_frac))
+    y_bot_frac = max(y_top_frac + 0.12, min(0.94, y_bot_frac))
+    crop = shot.crop(
+        (
+            int(w * 0.04),
+            int(h * y_top_frac),
+            int(w * 0.96),
+            int(h * y_bot_frac),
+        )
+    )
+    bordered = Image.new("RGB", (crop.width + 16, crop.height + 16), (255, 255, 255))
+    bordered.paste(crop, (8, 8))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    bordered.save(out, format="PNG", optimize=True)
+    return out
 
 
 def _label_font(size: int = 15):
@@ -354,46 +639,84 @@ def _label_font(size: int = 15):
     return ImageFont.load_default()
 
 
+def _wrap_caption(text: str, max_chars: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    lines: list[str] = []
+    cur = words[0]
+    for w in words[1:]:
+        if len(cur) + 1 + len(w) <= max_chars:
+            cur = f"{cur} {w}"
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    return lines[:5]
+
+
 def _collage(
     paths: list[Path],
     out: Path,
     *,
     photo_numbers: list[int] | None = None,
-    cols: int = 2,
+    captions: dict[int, str] | None = None,
+    cols: int = 4,
 ) -> Path:
-    """Build a clean labeled contact sheet for the Photos Excel cell."""
+    """4-column contact sheet: every photo + original caption under each tile."""
     if not paths:
         raise ValueError("no photos for collage")
     nums = list(photo_numbers or [])
     while len(nums) < len(paths):
         nums.append(len(nums) + 1)
+    captions = captions or {}
 
-    # Prefer 2 columns; use 1 column when only one photo.
-    cols = 1 if len(paths) == 1 else min(cols, 2)
-    cell_w, img_h, label_h = 420, 300, 28
-    tile_h = img_h + label_h
-    pad = 12
+    # >10 tiles always lock to 4 columns (4×N); 4–10 also 4-col; 1–3 stay narrow.
+    cols = _collage_cols(len(paths)) if cols == 4 else max(1, min(4, len(paths), cols))
+    # Large tiles so Excel column-fill stays engineer-readable (file size OK).
+    if cols >= 4:
+        cell_w = 420 if len(paths) > 10 else 460
+    elif cols == 3:
+        cell_w = 480
+    else:
+        cell_w = 560
+    img_h = int(cell_w * 0.82)
+    caption_h = 88
+    tile_h = img_h + caption_h
+    pad = 6
     font = _label_font(14)
     tiles: list[Image.Image] = []
 
     for path, num in zip(paths, nums):
         with Image.open(path) as src:
-            im = src.convert("RGB")
-            im.thumbnail((cell_w - 8, img_h - 8), Image.Resampling.LANCZOS)
+            src_im = src.convert("RGB")
+            # Cover-fit: fill the photo frame (crop center) — no empty gutters in-tile.
+            tw, th = cell_w - 4, img_h - 4
+            scale = max(tw / max(src_im.width, 1), th / max(src_im.height, 1))
+            rw = max(1, int(src_im.width * scale))
+            rh = max(1, int(src_im.height * scale))
+            scaled = src_im.resize((rw, rh), Image.Resampling.LANCZOS)
+            left = max(0, (rw - tw) // 2)
+            top = max(0, (rh - th) // 2)
+            im = scaled.crop((left, top, left + tw, top + th))
         tile = Image.new("RGB", (cell_w, tile_h), (255, 255, 255))
-        x = (cell_w - im.width) // 2
-        y = (img_h - im.height) // 2
-        tile.paste(im, (x, y))
+        tile.paste(im, (2, 2))
         draw = ImageDraw.Draw(tile)
-        draw.rectangle([0, 0, cell_w - 1, img_h - 1], outline=(160, 160, 160), width=1)
+        draw.rectangle([0, 0, cell_w - 1, img_h - 1], outline=(140, 140, 140), width=1)
         draw.rectangle(
             [0, img_h, cell_w - 1, tile_h - 1],
             fill=(245, 245, 245),
-            outline=(160, 160, 160),
+            outline=(140, 140, 140),
             width=1,
         )
-        label = f"Photo #{int(num):02d}"
-        draw.text((8, img_h + 6), label, fill=(30, 30, 30), font=font)
+        header = f"Photo #{int(num):02d}"
+        body = re.sub(r"\s+", " ", captions.get(int(num), "") or "").strip()
+        body = re.sub(rf"(?i)^photo\s*#?\s*{int(num)}\s*:?\s*", "", body).strip(" -:")
+        caption = f"{header}: {body}" if body else header
+        ty = img_h + 4
+        for line in _wrap_caption(caption, max_chars=max(28, cell_w // 8)):
+            draw.text((5, ty), line, fill=(20, 20, 20), font=font)
+            ty += 15
         tiles.append(tile)
 
     rows = (len(tiles) + cols - 1) // cols
@@ -404,14 +727,29 @@ def _collage(
         r, c = divmod(idx, cols)
         canvas.paste(tile, (pad + c * (cell_w + pad), pad + r * (tile_h + pad)))
 
-    # Cap very tall sheets so Excel cells stay reviewable.
-    max_h = 1600
-    if canvas.height > max_h:
-        nw = max(1, int(canvas.width * (max_h / canvas.height)))
-        canvas = canvas.resize((nw, max_h), Image.Resampling.LANCZOS)
-
     out.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out, format="PNG", optimize=True)
+    canvas.save(out, format="PNG", optimize=False)
+    return out
+
+
+def _caption_map_from_bullets(bullets: list[str]) -> dict[int, str]:
+    """Map Photo # → original caption body for collage labels."""
+    out: dict[int, str] = {}
+    for bullet in bullets:
+        text = bullet.lstrip("-• ").strip()
+        m = re.search(
+            r"(?is)^(.+?)\s*\(?\s*Photo\s*#?\s*(\d+)\s*(?:[-–—&to]+\s*\d+)?\s*\)?\s*$",
+            text,
+        )
+        if not m:
+            m = re.search(r"(?i)Photo\s*#?\s*(\d+)\s*[:.\-]\s*(.+)$", text)
+            if m:
+                out[int(m.group(1))] = re.sub(r"\s+", " ", m.group(2)).strip()
+            continue
+        body = re.sub(r"\s+", " ", m.group(1)).strip(" -:")
+        num = int(m.group(2))
+        if body:
+            out[num] = body
     return out
 
 
@@ -477,9 +815,24 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
             )
             if m:
                 result.line_number = _normalize_line_tag(m.group(1).split("(")[0])
+        # Parenthetical From–To under Equipment ID / line tag (fallback when
+        # summary checklist is missing or a different facility format).
+        m = re.search(
+            r"(?is)(?:Equipment\s*ID|Line\s*Number)\s*\n\s*[^\n]+\n\s*\(([^)]{5,160})\)",
+            full,
+        )
+        if not m:
+            m = re.search(
+                r"(?i)\(((?:From\s+)?[^()]{3,80}\s+to\s+[^()]{3,80})\)",
+                full,
+            )
+        if m:
+            paren = normalize_whitespace(m.group(1))
+            if paren and re.search(r"(?i)\bto\b", paren):
+                result.line_description = paren
         m = re.search(r"(?i)P\s*&\s*ID\s*NUMBER\s*:\s*([^\n]+)", full)
         if m:
-            result.pid_no = re.sub(r"\s+", "", m.group(1).strip())
+            result.pid_no = _prefer_pid(m.group(1).strip())
 
         m = re.search(
             r"(?is)Anomaly\s*description\s*(.+?)(?=General view|Close view|Further|"
@@ -498,63 +851,102 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
         result.photo_refs = refs
 
         stem = re.sub(r"[^\w.-]+", "_", pdf_path.stem)[:60]
-        photo_paths: list[Path] = []
-        iso_pages: list[int] = []
-        for i in range(doc.page_count):
-            page_text = doc[i].get_text("text") or ""
-            if re.search(r"(?i)drawing\s+not\s+to\s+scale", page_text):
-                iso_pages.append(i)
-                continue
-            photo_paths.extend(_extract_photos_from_page(doc, i, photos_dir, stem))
+        shots_dir = work_dir / "shots"
+        singles_dir = photos_dir / "singles"
+        shots_dir.mkdir(parents=True, exist_ok=True)
+        singles_dir.mkdir(parents=True, exist_ok=True)
 
-        uniq: list[Path] = []
+        photo_paths: list[Path] = []
+        # (page_index, optional iso y_band, allow_mixed)
+        iso_jobs: list[tuple[int, tuple[float, float] | None, bool]] = []
+        for i in range(doc.page_count):
+            page = doc[i]
+            page_text = page.get_text("text") or ""
+            kind = _classify_page(page_text)
+            if kind == "other":
+                continue
+            shot = _render_page_shot(page, _SHOT_ZOOM)
+            shot_path = shots_dir / f"{stem}_p{i + 1:02d}_{kind}.png"
+            shot.save(shot_path, format="PNG", optimize=True)
+
+            if kind == "iso_page":
+                iso_jobs.append((i, None, False))
+                continue
+            if kind == "photo_page":
+                photo_paths.extend(
+                    _crop_photos_from_shot(
+                        page,
+                        shot,
+                        zoom=_SHOT_ZOOM,
+                        out_dir=singles_dir,
+                        stem=stem,
+                        page_index=i,
+                    )
+                )
+                continue
+            if kind == "mixed_page":
+                photo_band, iso_band = _mixed_band_fracs(page)
+                photo_paths.extend(
+                    _crop_photos_from_shot(
+                        page,
+                        shot,
+                        zoom=_SHOT_ZOOM,
+                        out_dir=singles_dir,
+                        stem=stem,
+                        page_index=i,
+                        y_band=photo_band,
+                    )
+                )
+                iso_jobs.append((i, iso_band, True))
+
+        # Dedupe identical screenshot crops; preserve page reading order.
+        uniq_paths: list[Path] = []
         seen_sizes: set[tuple[int, int, int]] = set()
-        for p in photo_paths:
-            with Image.open(p) as im:
-                key = (im.size[0], im.size[1], p.stat().st_size)
+        for path in photo_paths:
+            with Image.open(path) as im:
+                key = (im.size[0], im.size[1], path.stat().st_size)
             if key in seen_sizes:
                 continue
             seen_sizes.add(key)
-            uniq.append(p)
-        result.has_photos = bool(uniq)
-        if uniq:
+            uniq_paths.append(path)
+
+        result.has_photos = bool(uniq_paths)
+        caption_by_num = _caption_map_from_bullets(result.caption_bullets)
+        if uniq_paths:
+            numbers = _assign_photo_numbers(
+                len(uniq_paths), caption_by_num, result.photo_refs
+            )
             collage = photos_dir / f"{stem}_photos.png"
-            # Number tiles from photo refs when available, else 1..N
-            numbers: list[int] = []
-            if result.photo_refs:
-                for ref in result.photo_refs:
-                    for n in range(ref.start, ref.end + 1):
-                        numbers.append(n)
-            if len(numbers) < len(uniq):
-                numbers = list(range(1, len(uniq) + 1))
-            else:
-                numbers = numbers[: len(uniq)]
             result.photo_paths = [
-                _collage(uniq, collage, photo_numbers=numbers)
+                _collage(
+                    uniq_paths,
+                    collage,
+                    photo_numbers=numbers,
+                    captions=caption_by_num,
+                    cols=_collage_cols(len(uniq_paths)),
+                )
             ]
         else:
             result.photo_paths = []
 
-        if iso_pages:
-            page_index = iso_pages[-1]
+        # Prefer dedicated iso_page, then mixed_page sketch band (no anomaly tiles).
+        pure_iso = [j for j in iso_jobs if not j[2]]
+        mixed_iso = [j for j in iso_jobs if j[2]]
+        ordered_iso = list(reversed(pure_iso)) + list(reversed(mixed_iso))
+        for page_index, iso_band, allow_mixed in ordered_iso:
             page = doc[page_index]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-            im = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-            w, h = im.size
-            # Trim header / signature bands; keep the sketch readable.
-            crop = im.crop(
-                (int(w * 0.05), int(h * 0.08), int(w * 0.95), int(h * 0.86))
-            )
-            # Soft white border so ISO sits cleanly in the cell
-            bordered = Image.new(
-                "RGB",
-                (crop.width + 16, crop.height + 16),
-                (255, 255, 255),
-            )
-            bordered.paste(crop, (8, 8))
+            shot = _render_page_shot(page, _SHOT_ZOOM)
             iso_out = iso_dir / f"{stem}_iso.png"
-            bordered.save(iso_out, format="PNG", optimize=True)
-            result.iso_path = iso_out
+            rendered = _crop_iso_from_shot(
+                page,
+                shot,
+                iso_out,
+                y_band=iso_band,
+                allow_mixed=allow_mixed,
+            )
+            if rendered is not None:
+                result.iso_path = rendered
+                break
     finally:
         doc.close()
     return result
@@ -670,22 +1062,35 @@ def build_edop_result(
     finally:
         doc.close()
 
+    warnings: list[str] = []
     if not summary_rows:
-        raise ValueError(
-            "Could not read the Visual Inspection Observations Checklist from the "
-            "summary PDF. Upload the Process Piping Summary Report (not a line PDF) "
-            "in the summary slot."
+        # General tool: do not hard-fail — continue from line PDFs alone.
+        kind = detect_pdf_kind(summary_pdf)
+        warnings.append(
+            "summary_checklist_not_parsed: "
+            f"treated upload as `{kind}`; Line Description will come from each "
+            "line PDF when available. For richest From–To text, upload a Process "
+            "Piping Visual Inspection Observations Checklist as the summary."
         )
-    if not re.search(r"(?i)checklist|process piping|FVI", sample):
+        logger.warning("%s (%s)", warnings[-1], summary_pdf.name)
+    elif not re.search(r"(?i)checklist|process piping|FVI", sample):
+        warnings.append(f"summary_text_unusual:{summary_pdf.name}")
         logger.warning("Summary PDF text looks unusual: %s", summary_pdf.name)
 
     summary_by_sn = {r.sn: r for r in summary_rows}
     line_pdfs, discover_notes = discover_line_pdfs(line_pdf_dir)
     if not line_pdfs:
+        kind = detect_pdf_kind(summary_pdf)
+        if kind == "fire_water":
+            raise ValueError(
+                "This looks like a Fire Water FVI report. Switch to "
+                "Workflow A (or Auto) and upload that single PDF there — "
+                "Workflow B is for Process Piping summary + line packs."
+            )
         raise ValueError(
-            "No line-number PDFs were recognized. Keep names like "
-            "`8._AI-001-….pdf` (or `8_AI-001-….pdf`), or ensure each PDF has "
-            "`JV Piping List S/N` inside."
+            "No line-number PDFs were recognized. Upload the per-line PDFs "
+            "(names like `8._AI-001-….pdf`) or a zip of them. "
+            "For a single Fire Water report, use Workflow A instead."
         )
 
     sns = sorted(line_pdfs)
@@ -707,7 +1112,12 @@ def build_edop_result(
         line_description = None
         if summary:
             line_description = join_from_to(summary.from_text, summary.to_text)
-        pid_no = (summary.pid_no if summary else None) or parsed.pid_no
+        if not line_description:
+            line_description = parsed.line_description
+        pid_no = _prefer_pid(
+            summary.pid_no if summary else None,
+            parsed.pid_no,
+        )
 
         if parsed.has_photos and parsed.caption_bullets:
             anomaly = "\n".join(parsed.caption_bullets)
@@ -748,13 +1158,15 @@ def build_edop_result(
     no_data = sum(
         1 for f in findings if (f.anomaly_description or "").strip().lower() == "no data"
     )
-    warnings = [
-        f"edop_line_pdfs={len(findings)}",
-        f"summary_rows={len(summary_rows)}",
-        f"line_descriptions_matched={matched_with_desc}",
-        f"rows_with_photos={with_photos}",
-        f"rows_no_data={no_data}",
-    ]
+    warnings.extend(
+        [
+            f"edop_line_pdfs={len(findings)}",
+            f"summary_rows={len(summary_rows)}",
+            f"line_descriptions_matched={matched_with_desc}",
+            f"rows_with_photos={with_photos}",
+            f"rows_no_data={no_data}",
+        ]
+    )
     warnings.extend(discover_notes[:40])
     if len(discover_notes) > 40:
         warnings.append(f"...and {len(discover_notes) - 40} more discovery notes")
