@@ -12,7 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from rbws_extractor.excel.writer import RbwsExcelWriter
-from rbws_extractor.ocr.edop_piping import build_edop_result
+from rbws_extractor.ocr.edop_piping import build_edop_result, detect_pdf_kind
 from rbws_extractor.pipeline.ocr_pipeline import OcrPipeline
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "quest-global-logo.svg"
@@ -268,6 +268,7 @@ button[data-testid="stBaseButton-primary"]:hover {
 </style>
 """
 
+WORKFLOW_AUTO = "Auto · detect from upload"
 WORKFLOW_FIRE_WATER = "Workflow A · Fire Water FVI (single PDF)"
 WORKFLOW_EDOP = "Workflow B · Process Piping (summary + line PDFs)"
 
@@ -291,13 +292,13 @@ def _render_chrome() -> None:
             <div>
                 <p class="mast-kicker">Quest Global Engineering Services Limited</p>
                 <h1>RBWS FVI Extractor</h1>
-                <p class="mast-sub">Two inspection workflows → gold-layout RBWS Excel. Local OCR/rules only — no LLM calls.</p>
+                <p class="mast-sub">General RBWS extractor for Fire Water and Process Piping FVI packs. Local OCR/rules only — no LLM calls.</p>
             </div>
             <div class="mast-meta">
-                <strong>Workflow A</strong>
-                Fire Water · 1 PDF
-                <strong>Workflow B</strong>
-                Process Piping · summary + lines
+                <strong>Auto</strong>
+                Detect from upload
+                <strong>A / B</strong>
+                Fire Water · Piping
             </div>
         </header>
         <section class="workflow-grid">
@@ -313,12 +314,12 @@ def _render_chrome() -> None:
             </div>
             <div class="workflow-card">
                 <span class="idx">B</span>
-                <strong>Process Piping (e.g. EDOP-QP)</strong>
-                <p>Summary checklist PDF <em>plus</em> one PDF per line number.</p>
+                <strong>Process Piping (e.g. EDOP-QP, EAP-GN)</strong>
+                <p>Summary checklist PDF <em>plus</em> one PDF per line number (or a zip).</p>
                 <ul>
-                    <li>Summary → Line Description (From–To)</li>
-                    <li>Line PDF → anomaly text under images + photo crops</li>
-                    <li>No images in a line pack → <code>no data</code></li>
+                    <li>Summary → Line Description (From–To) when checklist parses</li>
+                    <li>Line PDF → anomaly under images + photo / ISO crops</li>
+                    <li>Wrong slot? Use <em>Auto</em> — we detect Fire Water vs Piping</li>
                 </ul>
             </div>
         </section>
@@ -467,13 +468,26 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
         line_dir = temp_dir / "lines"
         line_dir.mkdir(parents=True, exist_ok=True)
         saved, save_notes = _save_line_uploads(line_files, line_zips, line_dir)
+
+        kind = detect_pdf_kind(summary_path)
+        # Fire Water PDF dropped into the piping summary slot with no line pack
+        # → route to Workflow A instead of failing on checklist parse.
+        if saved == 0 and kind == "fire_water":
+            st.info(
+                "Detected a Fire Water FVI report in the summary slot — "
+                "running Workflow A automatically."
+            )
+            _run_fire_water(summary_file, max_pages=0, skip_images=skip_images)
+            return
+
         if saved == 0:
             raise ValueError(
-                "No line-number PDFs were saved. Upload the per-line PDFs "
-                "(or a .zip of them). Names like `8._AI-001-….pdf` work best."
+                "No line-number PDFs were saved. For Process Piping, upload the "
+                "per-line PDFs (or a .zip). For a single Fire Water report, use "
+                "Workflow A / Auto."
             )
 
-        out_path = temp_dir / "EDOP-QP_RBWS_REVIEW.xlsx"
+        out_path = temp_dir / "ProcessPiping_RBWS_REVIEW.xlsx"
         work_dir = temp_dir / "work"
         with st.spinner(
             f"Workflow B · summary + {saved} line PDF(s). This can take several minutes."
@@ -495,9 +509,56 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
             st.session_state.excel_bytes = out_path.read_bytes()
             st.session_state.excel_name = out_path.name
             st.session_state.findings_n = len(result.findings)
-            st.session_state.warnings = save_notes + list(result.warnings)
+            st.session_state.warnings = (
+                [f"summary_detected_as={kind}"] + save_notes + list(result.warnings)
+            )
             st.session_state.workflow_done = WORKFLOW_EDOP
             st.session_state.edop_saved_lines = saved
+
+
+def _run_auto(
+    primary_file,
+    line_files,
+    line_zips,
+    *,
+    skip_images: bool,
+    max_pages: int,
+) -> None:
+    """Route Fire Water vs Process Piping from the uploaded PDF content."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+        primary_path = temp_dir / _safe_pdf_name(primary_file.name)
+        primary_path.write_bytes(primary_file.getvalue())
+        kind = detect_pdf_kind(primary_path)
+
+    has_lines = bool(line_files) or bool(line_zips)
+    if kind == "fire_water" or (kind == "unknown" and not has_lines):
+        if kind == "unknown":
+            st.info("Could not classify the PDF confidently — trying Workflow A (single report).")
+        else:
+            st.info("Detected Fire Water FVI — running Workflow A.")
+        _run_fire_water(primary_file, max_pages=max_pages, skip_images=skip_images)
+        return
+
+    if kind in {"process_piping_summary", "process_piping_unknown", "process_piping_line"} or has_lines:
+        if not has_lines and kind == "process_piping_line":
+            raise ValueError(
+                "This looks like a single Process Piping *line* PDF. "
+                "Upload the summary checklist plus all line PDFs (or a zip) under Workflow B / Auto."
+            )
+        if not has_lines:
+            raise ValueError(
+                "Detected Process Piping. Upload the line-number PDFs (or a zip) "
+                "in addition to the summary, then generate again."
+            )
+        st.info("Detected Process Piping pack — running Workflow B.")
+        _run_edop(primary_file, line_files, line_zips, skip_images=skip_images)
+        return
+
+    raise ValueError(
+        "Could not detect report type. Use Workflow A for one Fire Water PDF, "
+        "or Workflow B for Process Piping summary + line PDFs."
+    )
 
 
 st.set_page_config(page_title="RBWS FVI Extractor", layout="wide")
@@ -513,16 +574,24 @@ if not _app_password():
 
 _render_chrome()
 
+def _show_run_error(exc: Exception) -> None:
+    _clear_workbook()
+    st.error(f"Processing failed: {exc}")
+    # Keep stack traces for unexpected bugs only.
+    if not isinstance(exc, ValueError):
+        st.exception(exc)
+
+
 with st.sidebar:
     st.markdown('<p class="side-label">Job controls</p>', unsafe_allow_html=True)
     workflow = st.radio(
         "Select workflow",
-        options=[WORKFLOW_FIRE_WATER, WORKFLOW_EDOP],
+        options=[WORKFLOW_AUTO, WORKFLOW_FIRE_WATER, WORKFLOW_EDOP],
         index=0,
     )
     skip_images = st.checkbox("Omit photograph / ISO embeds", value=False)
     max_pages = 0
-    if workflow == WORKFLOW_FIRE_WATER:
+    if workflow in {WORKFLOW_FIRE_WATER, WORKFLOW_AUTO}:
         max_pages = st.number_input(
             "Page limit (0 = full document)",
             min_value=0,
@@ -530,7 +599,8 @@ with st.sidebar:
             step=1,
         )
     st.markdown(
-        '<p class="side-note">Uploads stay in a temporary folder for this job and are removed when processing finishes. Processing is local OCR/rules — no LLM API calls.</p>',
+        '<p class="side-note">Prefer <strong>Auto</strong> if you are unsure. '
+        "Uploads stay temporary for this job. Local OCR/rules only — no LLM calls.</p>",
         unsafe_allow_html=True,
     )
 
@@ -538,7 +608,53 @@ if st.session_state.get("active_workflow") != workflow:
     st.session_state.active_workflow = workflow
     _clear_workbook()
 
-if workflow == WORKFLOW_FIRE_WATER:
+if workflow == WORKFLOW_AUTO:
+    st.markdown(
+        '<p class="panel-label">Auto</p>'
+        '<p class="work-title">Detect report type from the upload</p>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "**Fire Water:** upload one full FVI PDF.\n\n"
+        "**Process Piping:** upload the summary/checklist PDF **and** the line-number PDFs (or a zip). "
+        "We detect which pack you have and run the matching pipeline."
+    )
+    primary = st.file_uploader(
+        "Primary PDF (Fire Water report OR Process Piping summary)",
+        type=["pdf"],
+        key="auto_primary",
+    )
+    line_files = st.file_uploader(
+        "Line-number PDFs (Process Piping only — multi-select)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="auto_lines",
+    )
+    line_zips = st.file_uploader(
+        "Or zip of line-number PDFs (Process Piping only)",
+        type=["zip"],
+        accept_multiple_files=True,
+        key="auto_zips",
+    )
+    ready = primary is not None
+    if st.button("Generate workbook", type="primary", disabled=not ready, key="run_auto"):
+        try:
+            _run_auto(
+                primary,
+                line_files,
+                line_zips,
+                skip_images=skip_images,
+                max_pages=int(max_pages),
+            )
+        except Exception as exc:
+            _show_run_error(exc)
+    elif not ready:
+        st.markdown(
+            '<p class="status-line"><em>Waiting</em> · Upload a PDF to begin.</p>',
+            unsafe_allow_html=True,
+        )
+
+elif workflow == WORKFLOW_FIRE_WATER:
     st.markdown(
         '<p class="panel-label">Workflow A</p>'
         '<p class="work-title">Fire Water FVI — single report PDF</p>',
@@ -546,7 +662,7 @@ if workflow == WORKFLOW_FIRE_WATER:
     )
     st.info(
         "Use this for Jimcel **Fire Water** reports (example: UBIT-GP). "
-        "Upload **one** full inspection PDF. The app builds RBWS rows from observation tables and crops photos/ISO."
+        "Upload **one** full inspection PDF."
     )
     uploaded = st.file_uploader(
         "Fire Water inspection PDF",
@@ -564,9 +680,7 @@ if workflow == WORKFLOW_FIRE_WATER:
         try:
             _run_fire_water(uploaded, max_pages=int(max_pages), skip_images=skip_images)
         except Exception as exc:
-            _clear_workbook()
-            st.error(f"Processing failed: {exc}")
-            st.exception(exc)
+            _show_run_error(exc)
     elif not ready:
         st.markdown(
             '<p class="status-line"><em>Waiting</em> · Upload the Fire Water PDF, then generate.</p>',
@@ -580,17 +694,17 @@ else:
         unsafe_allow_html=True,
     )
     st.info(
-        "Use this for **EDOP-QP Process Piping** (and similar packs).\n\n"
-        "1. Upload the **summary / checklist** PDF only (From–To line descriptions).\n"
-        "2. Upload **all line-number PDFs**, or one **.zip** of them "
-        "(anomaly text under images + photo crops).\n\n"
-        "Keep Workflow **B** selected. Do not put line PDFs in the summary slot."
+        "Use this for **Process Piping** packs (EDOP-QP, EAP-GN, and similar).\n\n"
+        "1. Upload the **summary / checklist** PDF (From–To line descriptions).\n"
+        "2. Upload **all line-number PDFs**, or one **.zip** of them.\n\n"
+        "If you upload a Fire Water PDF here by mistake, we will detect it and "
+        "switch to Workflow A when no line pack is present."
     )
     summary_file = st.file_uploader(
-        "1 · Summary / checklist PDF (required)",
+        "1 · Summary / checklist PDF",
         type=["pdf"],
         key="edop_summary",
-        help="EDOP-QP FVI On Process Piping Summary Report — not a line PDF",
+        help="Process Piping summary / observations checklist",
     )
     line_files = st.file_uploader(
         "2a · Line-number PDFs (multi-select)",
@@ -604,7 +718,7 @@ else:
         type=["zip"],
         accept_multiple_files=True,
         key="edop_zips",
-        help="Optional: zip containing the line PDFs (more reliable than 100+ browser uploads)",
+        help="Optional: zip containing the line PDFs",
     )
     if summary_file is not None:
         size = getattr(summary_file, "size", None) or 0
@@ -621,7 +735,8 @@ else:
             f'{f" · {n_zips} zip(s)" if n_zips else ""}</p>',
             unsafe_allow_html=True,
         )
-    ready = summary_file is not None and (n_lines > 0 or n_zips > 0)
+    # Summary alone is enough to attempt Fire Water auto-route; otherwise need lines.
+    ready = summary_file is not None
     if st.button("Generate workbook", type="primary", disabled=not ready, key="run_b"):
         try:
             _run_edop(
@@ -631,12 +746,11 @@ else:
                 skip_images=skip_images,
             )
         except Exception as exc:
-            _clear_workbook()
-            st.error(f"Processing failed: {exc}")
-            st.exception(exc)
+            _show_run_error(exc)
     elif not ready:
         st.markdown(
-            '<p class="status-line"><em>Waiting</em> · Upload the summary PDF and the line-number PDFs (or a zip), then generate.</p>',
+            '<p class="status-line"><em>Waiting</em> · Upload the summary PDF '
+            "(and line PDFs for Process Piping).</p>",
             unsafe_allow_html=True,
         )
 

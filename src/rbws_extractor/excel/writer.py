@@ -52,8 +52,8 @@ GOLD_COL_WIDTHS = {
     "K": 8.6,
     "L": 7.0,
     "M": 13.0,
-    "N": 48.0,  # Photos
-    "O": 48.0,  # ISO
+    "N": 110.0,  # Photos — wide so 4×N tiles stay readable
+    "O": 78.0,  # ISO sketch
     "P": 50.8,
     "Q": 27.9,
 }
@@ -62,10 +62,10 @@ GOLD_COL_WIDTHS = {
 _PHOTO_COL = 14  # N
 _ISO_COL = 15  # O
 
-# Soft caps so tall collages stay readable without burying the next row.
-_MIN_IMG_ROW_PT = 140.0
-_MAX_IMG_ROW_PT = 300.0
-_CELL_PAD_PX = 8
+# Excel clamps row height near 409pt — use the full budget for engineer review.
+_MIN_IMG_ROW_PT = 200.0
+_MAX_IMG_ROW_PT = 409.0
+_CELL_PAD_PX = 4
 
 THIN = Border(
     left=Side(style="thin", color="B0B0B0"),
@@ -145,7 +145,7 @@ class RbwsExcelWriter:
 
         photo_max_w = _col_width_to_px(GOLD_COL_WIDTHS["N"]) - _CELL_PAD_PX
         iso_max_w = _col_width_to_px(GOLD_COL_WIDTHS["O"]) - _CELL_PAD_PX
-        # First-pass height budget for fitting; row is resized to the fitted image.
+        # Excel row-height ceiling in pixels; used only as a soft display cap.
         fit_budget_h = int(_MAX_IMG_ROW_PT * 96.0 / 72.0) - _CELL_PAD_PX
 
         data_start = 3
@@ -169,6 +169,7 @@ class RbwsExcelWriter:
                     path=finding.photos_image_path,
                     max_w=photo_max_w,
                     max_h=fit_budget_h,
+                    fill_width=True,
                 )
                 ih = self._embed_image(
                     ws,
@@ -177,6 +178,7 @@ class RbwsExcelWriter:
                     path=finding.iso_image_path,
                     max_w=iso_max_w,
                     max_h=fit_budget_h,
+                    fill_width=True,
                 )
                 if ph:
                     display_heights.append(ph)
@@ -184,9 +186,8 @@ class RbwsExcelWriter:
                     display_heights.append(ih)
 
             if display_heights:
-                # Size the row to the taller fitted image so Photos/ISO never
-                # spill into the next finding.
-                needed = max(display_heights) + 10.0
+                # Match row height to the embedded image (Excel clamps ~409pt).
+                needed = max(display_heights) + 6.0
                 ws.row_dimensions[row_idx].height = min(
                     _MAX_IMG_ROW_PT, max(_MIN_IMG_ROW_PT, needed)
                 )
@@ -227,34 +228,53 @@ class RbwsExcelWriter:
         *,
         max_w: int,
         max_h: int,
+        fill_width: bool = True,
     ) -> float | None:
-        """Embed an image fitted inside the cell box. Returns display height in points."""
+        """Embed image filling the column width (no side gaps). Returns height in points."""
         if path is None or not Path(path).exists():
             return None
         try:
             src = Path(path)
             with PILImage.open(src) as im:
                 im = im.convert("RGB")
-                # Letterbox onto a white canvas at the target cell aspect so the
-                # engineer always sees a clean, non-cropped contact sheet.
-                scale = min(max_w / max(im.width, 1), max_h / max(im.height, 1), 1.0)
-                new_w = max(1, int(im.width * scale))
-                new_h = max(1, int(im.height * scale))
-                if scale < 1.0:
+                if fill_width:
+                    # Stretch to column width; keep aspect. Upscale when source is small
+                    # so tiles stay recognizable for engineers.
+                    scale = max_w / max(im.width, 1)
+                    new_w = max_w
+                    new_h = max(1, int(im.height * scale))
+                    # If taller than Excel's practical row budget, scale to that height
+                    # while still preferring as much width as possible.
+                    if new_h > max_h:
+                        scale_h = max_h / max(im.height, 1)
+                        scale_w = max_w / max(im.width, 1)
+                        # Prefer width fill when aspect is landscape; otherwise height cap.
+                        if im.width >= im.height:
+                            scale = scale_w
+                            new_w = max_w
+                            new_h = max(1, int(im.height * scale))
+                            if new_h > max_h:
+                                new_h = max_h
+                                new_w = max(1, int(im.width * (max_h / max(im.height, 1))))
+                                new_w = min(new_w, max_w)
+                        else:
+                            scale = min(scale_w, scale_h)
+                            new_w = max(1, int(im.width * scale))
+                            new_h = max(1, int(im.height * scale))
                     im = im.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
                 else:
-                    new_w, new_h = im.width, im.height
+                    scale = min(max_w / max(im.width, 1), max_h / max(im.height, 1))
+                    new_w = max(1, int(im.width * scale))
+                    new_h = max(1, int(im.height * scale))
+                    im = im.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
 
-                canvas = PILImage.new("RGB", (max_w, max(new_h, 1)), (255, 255, 255))
-                x = (max_w - new_w) // 2
-                canvas.paste(im, (x, 0))
+                # No letterbox — image is the embed (avoids empty side gutters).
                 fitted = src.with_name(f"{src.stem}_cell{src.suffix}")
-                canvas.save(fitted, format="PNG", optimize=True)
-                display_h_px = canvas.height
+                im.save(fitted, format="PNG", optimize=False)
+                display_w, display_h_px = im.size
 
             img = XLImage(str(fitted))
-            # Lock Excel display size to the fitted pixel box (prevents blow-up).
-            img.width = max_w
+            img.width = display_w
             img.height = display_h_px
             img.anchor = f"{get_column_letter(col)}{row_idx}"
             ws.add_image(img)
