@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import io
 import re
 from dataclasses import dataclass, field
@@ -365,6 +366,7 @@ def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
     return rows
 
 
+# Higher zoom so caption text / corrosion detail stay readable in Excel.
 _SHOT_ZOOM = 2.0
 
 
@@ -409,47 +411,30 @@ def _classify_page(text: str) -> str:
     return "other"
 
 
-def _mixed_band_fracs(page: fitz.Page) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return ((photo_y0, photo_y1), (iso_y0, iso_y1)) as page-height fractions."""
+def _line_split_frac(page: fitz.Page) -> float | None:
+    """Page-height fraction of the LINE NUMBER label (start of the ISO sketch)."""
     page_h = float(page.rect.height) or 1.0
-    photo_ys: list[float] = []
-    iso_ys: list[float] = []
-    for winfo in page.get_text("words") or []:
+    ys: list[float] = []
+    words = page.get_text("words") or []
+    for i, winfo in enumerate(words):
         token = (winfo[4] or "").strip()
-        y0 = float(winfo[1]) / page_h
-        low = token.lower()
-        if re.search(r"(?i)^photo$|^#\d+", token) or re.search(
-            r"(?i)general|close|further|sectional", token
-        ):
-            photo_ys.append(y0)
-        if re.search(r"(?i)^drawing$|^line$|^number$|^ref$", token) or "scale" in low:
-            iso_ys.append(y0)
-        if re.search(r"(?i)^prepared$|^verified$|^reviewed$|^approved$", token):
-            iso_ys.append(y0)
+        nxt = (words[i + 1][4] if i + 1 < len(words) else "") or ""
+        # Sketch header is uppercase "LINE NUMBER:" — not the form label "Line Number".
+        if token == "LINE" and nxt.upper().startswith("NUMBER"):
+            ys.append(float(winfo[1]) / page_h)
+    if not ys:
+        return None
+    return min(ys)
 
-    text = page.get_text("text") or ""
-    # Stronger anchors via full-text word positions already collected; fallbacks:
-    if not photo_ys and re.search(r"(?i)\(\s*Photo\s*#", text):
-        photo_ys = [0.15, 0.45]
-    if not iso_ys and (
-        "drawing not to scale" in text.lower()
-        or re.search(r"(?i)LINE\s*NUMBER\s*:", text)
-    ):
-        iso_ys = [0.55, 0.75]
 
-    if photo_ys and iso_ys:
-        photo_mid = sum(photo_ys) / len(photo_ys)
-        iso_mid = sum(iso_ys) / len(iso_ys)
-        if photo_mid < iso_mid:
-            split = (max(photo_ys) + min(iso_ys)) / 2.0
-            return (0.10, min(0.92, split)), (max(0.08, split), 0.88)
-        split = (max(iso_ys) + min(photo_ys)) / 2.0
-        return (max(0.08, split), 0.92), (0.08, min(0.88, split))
-    if photo_ys and not iso_ys:
-        return (0.10, 0.88), (0.50, 0.88)
-    if iso_ys and not photo_ys:
-        return (0.10, 0.45), (0.12, 0.88)
-    return (0.10, 0.48), (0.48, 0.88)
+def _prepared_frac(page: fitz.Page) -> float | None:
+    page_h = float(page.rect.height) or 1.0
+    ys = [
+        float(w[1]) / page_h
+        for w in (page.get_text("words") or [])
+        if re.fullmatch(r"(?i)Prepared", (w[4] or "").strip())
+    ]
+    return min(ys) if ys else None
 
 
 def _collage_cols(n: int) -> int:
@@ -481,6 +466,165 @@ def _render_page_shot(page: fitz.Page, zoom: float = _SHOT_ZOOM) -> Image.Image:
     return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
+@dataclass
+class PairedPhoto:
+    """One field photo cropped from a screenshot, locked to its caption."""
+
+    path: Path
+    photo_num: int
+    caption: str
+    y0: float
+    x0: float
+
+
+def _view_caption_anchors(
+    page: fitz.Page,
+) -> list[tuple[int, float, float, str]]:
+    """Return (photo_num, y0, x0, caption_body) for view captions (not Ref Photo).
+
+    Handles both ``(Photo #01)`` and ``(Photo # 01)`` tokenizations.
+    """
+    words = page.get_text("words") or []
+    anchors: list[tuple[int, float, float, str]] = []
+    for i, winfo in enumerate(words):
+        token = (winfo[4] or "").strip()
+        prev = (words[i - 1][4] if i else "") or ""
+        prev2 = (words[i - 2][4] if i >= 2 else "") or ""
+        prev3 = (words[i - 3][4] if i >= 3 else "") or ""
+        num: int | None = None
+        # Single token: "(Photo#02)" or "(Photo #02)"
+        m_one = re.fullmatch(r"\(?Photo\s*#\s*(\d{1,3})\)?", token, flags=re.I)
+        if m_one:
+            num = int(m_one.group(1))
+        else:
+            # "(Photo" "#" "01)"
+            m_split = re.fullmatch(r"(\d{1,3})\)?", token)
+            if m_split and re.fullmatch(r"#", prev) and re.search(r"(?i)photo", prev2):
+                if re.search(r"(?i)^ref", prev3):
+                    continue
+                num = int(m_split.group(1))
+            else:
+                m = re.fullmatch(r"#(\d{1,3})\)?", token)
+                if not m:
+                    continue
+                if not re.search(r"(?i)photo", prev):
+                    continue
+                if re.search(r"(?i)^ref", prev2):
+                    continue
+                num = int(m.group(1))
+        cy = float(winfo[1])
+        cx = float(winfo[0])
+        anchors.append((num, cy, cx, ""))
+
+    # Caption text is only the words in this photo's column, just above the
+    # "(Photo #NN)" marker — not the caption of the photo beside it.
+    filled: list[tuple[int, float, float, str]] = []
+    for num, cy, cx, _body in anchors:
+        left_limit = cx - 260.0
+        for onum, ocy, ocx, _ in anchors:
+            if onum == num and abs(ocy - cy) < 1 and abs(ocx - cx) < 1:
+                continue
+            if ocx < cx - 8 and abs(ocy - cy) < 18:
+                left_limit = max(left_limit, ocx + 4.0)
+        parts: list[tuple[float, float, str]] = []
+        for w2 in words:
+            y2, x2 = float(w2[1]), float(w2[0])
+            tok2 = (w2[4] or "").strip()
+            if not tok2 or re.search(r"(?i)^\(photo|^photo|^#\d|^#$|\d{1,3}\)$", tok2):
+                continue
+            if not (left_limit <= x2 < cx - 1.0):
+                continue
+            if not (cy - 48.0 <= y2 <= cy + 6.0):
+                continue
+            parts.append((y2, x2, tok2))
+        parts.sort()
+        body = re.sub(r"\s+", " ", " ".join(t for _, _, t in parts)).strip(" -:")
+        body = re.sub(r"(?i)\(?\s*$", "", body).strip(" -:")
+        filled.append((num, cy, cx, body))
+
+    seen: set[tuple[int, int]] = set()
+    uniq: list[tuple[int, float, float, str]] = []
+    for a in sorted(filled, key=lambda t: (t[1], t[2])):
+        key = (a[0], int(a[2] // 40))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+    return uniq
+
+
+def _text_under_photo(
+    page: fitz.Page, x0: float, y0: float, x1: float, y1: float
+) -> str:
+    """Words sitting under this photo, inside its own column."""
+    parts: list[tuple[float, float, str]] = []
+    for w in page.get_text("words") or []:
+        tok = (w[4] or "").strip()
+        if not tok or re.search(
+            r"(?i)^\(photo|^photo\s*#|^#\d|^#$|\(?photo#\d|\d{1,3}\)$", tok
+        ):
+            continue
+        if re.search(
+            r"(?i)^(prepared|verified|reviewed|approved|inspector|legend)$", tok
+        ):
+            continue
+        wx0, wy0, wx1 = float(w[0]), float(w[1]), float(w[2])
+        cx = (wx0 + wx1) / 2.0
+        if cx < x0 - 8.0 or cx > x1 + 8.0:
+            continue
+        if not (y1 - 16.0 <= wy0 <= y1 + 46.0):
+            continue
+        parts.append((wy0, wx0, tok))
+    parts.sort()
+    body = re.sub(r"\s+", " ", " ".join(t for _, _, t in parts)).strip(" -:")
+    return re.sub(r"(?i)\(?\s*$", "", body).strip(" -:")
+
+
+def _caption_bottom(
+    page: fitz.Page,
+    x0: float,
+    x1: float,
+    y1: float,
+    y_limit: float,
+) -> float:
+    """Bottom of the caption printed under this photo, in page points."""
+    bottom = y1
+    limit = min(y1 + 52.0, y_limit)
+    for w in page.get_text("words") or []:
+        tok = (w[4] or "").strip()
+        if not tok:
+            continue
+        wx0, wy0, wx1, wy1 = (float(w[0]), float(w[1]), float(w[2]), float(w[3]))
+        cx = (wx0 + wx1) / 2.0
+        if cx < x0 - 8.0 or cx > x1 + 8.0:
+            continue
+        if y1 - 8.0 <= wy0 <= limit:
+            bottom = max(bottom, wy1)
+    return min(bottom + 2.0, y_limit)
+
+
+def _merge_stacked_boxes(
+    boxes: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Merge vertically adjacent same-column image fragments into one photo box."""
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged: list[tuple[float, float, float, float]] = []
+    for x0, y0, x1, y1 in boxes:
+        if not merged:
+            merged.append((x0, y0, x1, y1))
+            continue
+        px0, py0, px1, py1 = merged[-1]
+        same_col = abs(x0 - px0) < 25 and abs(x1 - px1) < 25
+        touching = abs(y0 - py1) < 8
+        if same_col and touching:
+            merged[-1] = (min(px0, x0), py0, max(px1, x1), max(py1, y1))
+        else:
+            merged.append((x0, y0, x1, y1))
+    return merged
+
+
 def _crop_photos_from_shot(
     page: fitz.Page,
     shot: Image.Image,
@@ -490,16 +634,15 @@ def _crop_photos_from_shot(
     stem: str,
     page_index: int,
     y_band: tuple[float, float] | None = None,
-) -> list[Path]:
-    """Crop each field photo tile from a page screenshot (original pixels)."""
+) -> list[PairedPhoto]:
+    """Crop field photos and pair each with the caption sitting under it."""
     page_h = float(page.rect.height) or 1.0
     page_w = float(page.rect.width) or 1.0
     sw, sh = shot.size
     y_lo, y_hi = y_band if y_band is not None else (0.10, 0.90)
     infos = page.get_image_info(xrefs=True)
-    infos.sort(key=lambda im: (round(im["bbox"][1], 1), round(im["bbox"][0], 1)))
 
-    slots: dict[tuple[int, int], tuple[float, float, float, Image.Image]] = {}
+    raw_boxes: list[tuple[float, float, float, float]] = []
     for im in infos:
         bbox = im["bbox"]
         bw = float(bbox[2] - bbox[0])
@@ -509,68 +652,96 @@ def _crop_photos_from_shot(
         cy_frac = ((bbox[1] + bbox[3]) / 2.0) / page_h
         if cy_frac < y_lo or cy_frac > y_hi:
             continue
-        if bbox[1] < page_h * 0.08:
-            continue
-        if bbox[3] > page_h * 0.94:
+        if bbox[1] < page_h * 0.08 or bbox[3] > page_h * 0.94:
             continue
         if bw < page_w * 0.16 or bh < page_h * 0.09:
             continue
-        # Map PDF points → screenshot pixels
-        x0 = max(0, int(bbox[0] * zoom) - 2)
-        y0 = max(0, int(bbox[1] * zoom) - 2)
-        x1 = min(sw, int(bbox[2] * zoom) + 2)
-        y1 = min(sh, int(bbox[3] * zoom) + 2)
-        if x1 - x0 < 80 or y1 - y0 < 60:
+        raw_boxes.append(
+            (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        )
+
+    # Slot-dedupe near-identical embeds, then stitch stacked halves.
+    slots: dict[tuple[int, int], tuple[float, float, float, float]] = {}
+    for x0, y0, x1, y1 in raw_boxes:
+        key = (int(((x0 + x1) / 2.0) / 36.0), int(((y0 + y1) / 2.0) / 36.0))
+        area = (x1 - x0) * (y1 - y0)
+        prev = slots.get(key)
+        if prev is None or area > (prev[2] - prev[0]) * (prev[3] - prev[1]):
+            slots[key] = (x0, y0, x1, y1)
+    photo_boxes = _merge_stacked_boxes(list(slots.values()))
+
+    # Probe crops to drop logos / blank tiles before caption pairing.
+    candidates: list[tuple[float, float, float, float, Image.Image]] = []
+    for x0, y0, x1, y1 in photo_boxes:
+        sx0 = max(0, int(x0 * zoom) - 2)
+        sy0 = max(0, int(y0 * zoom) - 2)
+        sx1 = min(sw, int(x1 * zoom) + 2)
+        sy1 = min(sh, int(y1 * zoom) + 2)
+        if sx1 - sx0 < 80 or sy1 - sy0 < 60:
             continue
-        crop = shot.crop((x0, y0, x1, y1))
+        crop = shot.crop((sx0, sy0, sx1, sy1))
         if not _is_field_photo_crop(crop):
             continue
-        cx = int(((bbox[0] + bbox[2]) / 2.0) / 36.0)
-        cy = int(((bbox[1] + bbox[3]) / 2.0) / 36.0)
-        area = bw * bh
-        key = (cx, cy)
-        prev = slots.get(key)
-        if prev is None or area > prev[0]:
-            slots[key] = (area, float(bbox[1]), float(bbox[0]), crop)
+        candidates.append((x0, y0, x1, y1, crop))
 
-    ordered = sorted(slots.values(), key=lambda t: (t[1], t[2]))
-    paths: list[Path] = []
+    anchors = _view_caption_anchors(page)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for i, (_area, _y, _x, crop) in enumerate(ordered):
-        out = out_dir / f"{stem}_p{page_index + 1:02d}_img{i + 1:02d}.png"
-        crop.save(out, format="PNG", optimize=True)
-        paths.append(out)
-    return paths
-
-
-def _assign_photo_numbers(
-    n_tiles: int,
-    caption_by_num: dict[int, str],
-    photo_refs: list[PhotoRef],
-) -> list[int]:
-    """Assign Photo # labels in reading order without cross-page duplicates."""
-    if n_tiles <= 0:
-        return []
-    from_refs: list[int] = []
-    for ref in photo_refs:
-        for n in range(ref.start, ref.end + 1):
-            if n not in from_refs:
-                from_refs.append(n)
-    if len(from_refs) == n_tiles:
-        return from_refs
-    from_caps = sorted(caption_by_num.keys())
-    if len(from_caps) == n_tiles:
-        return from_caps
-    # Prefer caption/ref numbers for the leading tiles; fill the rest sequentially.
-    base = from_refs or from_caps
-    if not base:
-        return list(range(1, n_tiles + 1))
-    out = list(base[:n_tiles])
-    nxt = (max(out) if out else 0) + 1
-    while len(out) < n_tiles:
-        out.append(nxt)
-        nxt += 1
-    return out
+    paired: list[PairedPhoto] = []
+    used_anchor: set[int] = set()
+    # Reading order: same visual row (left to right), then the next row down.
+    order: list[int] = []
+    rows: list[list[int]] = []
+    for i in sorted(range(len(candidates)), key=lambda i: candidates[i][1]):
+        if not rows or candidates[i][1] - candidates[rows[-1][0]][1] > 36.0:
+            rows.append([i])
+        else:
+            rows[-1].append(i)
+    for row in rows:
+        order.extend(sorted(row, key=lambda i: candidates[i][0]))
+    for seq, i in enumerate(order, start=1):
+        x0, y0, x1, y1, crop = candidates[i]
+        best_a: int | None = None
+        best_score: float | None = None
+        for ai, (num, cy, cx, _body) in enumerate(anchors):
+            if ai in used_anchor:
+                continue
+            if y1 > cy + 18.0:
+                continue
+            gap = cy - y1
+            if gap > 160.0:
+                continue
+            photo_cx = (x0 + x1) / 2.0
+            score = gap + 0.05 * abs(photo_cx - cx)
+            if x0 - 20 <= cx <= x1 + 20:
+                score -= 15.0
+            if best_score is None or score < best_score:
+                best_score = score
+                best_a = ai
+        if best_a is not None:
+            used_anchor.add(best_a)
+            num = anchors[best_a][0]
+        else:
+            num = seq
+        body = _text_under_photo(page, x0, y0, x1, y1)
+        # Keep the original screenshot pixels, including the caption under the photo.
+        next_top = float(page.rect.height)
+        for j, (ox0, oy0, ox1, oy1, _other) in enumerate(candidates):
+            if j == i:
+                continue
+            if ox0 < x1 - 8 and ox1 > x0 + 8 and oy0 > y1 - 1:
+                next_top = min(next_top, oy0)
+        y_bot = _caption_bottom(page, x0, x1, y1, next_top - 1.5)
+        sx0 = max(0, int(x0 * zoom) - 2)
+        sy0 = max(0, int(y0 * zoom) - 2)
+        sx1 = min(sw, int(x1 * zoom) + 2)
+        sy1 = min(sh, int(y_bot * zoom) + 3)
+        crop = shot.crop((sx0, sy0, sx1, sy1))
+        out = out_dir / f"{stem}_p{page_index + 1:02d}_{seq:02d}_photo{num:02d}.png"
+        crop.save(out, format="PNG", optimize=False)
+        paired.append(
+            PairedPhoto(path=out, photo_num=num, caption=body, y0=y0, x0=x0)
+        )
+    return paired
 
 
 def _crop_iso_from_shot(
@@ -609,8 +780,26 @@ def _crop_iso_from_shot(
         if line_meta_y is not None:
             y_top_frac = max(0.05, min(0.22, line_meta_y - 0.01))
 
+    # Keep large field photos out of the ISO crop.
+    for im in page.get_image_info(xrefs=True):
+        bbox = im["bbox"]
+        bw = float(bbox[2] - bbox[0])
+        bh = float(bbox[3] - bbox[1])
+        if bw < page.rect.width * 0.18 or bh < page.rect.height * 0.10:
+            continue
+        cy = ((bbox[1] + bbox[3]) / 2.0) / page_h
+        if y_top_frac <= cy <= y_bot_frac:
+            photo_bot = float(bbox[3]) / page_h
+            photo_top = float(bbox[1]) / page_h
+            if photo_bot < (y_top_frac + y_bot_frac) / 2:
+                y_top_frac = max(y_top_frac, photo_bot + 0.01)
+            else:
+                y_bot_frac = min(y_bot_frac, photo_top - 0.01)
+
     y_top_frac = max(0.04, min(0.85, y_top_frac))
     y_bot_frac = max(y_top_frac + 0.12, min(0.94, y_bot_frac))
+    if y_bot_frac - y_top_frac < 0.12:
+        return None
     crop = shot.crop(
         (
             int(w * 0.04),
@@ -655,15 +844,22 @@ def _wrap_caption(text: str, max_chars: int) -> list[str]:
     return lines[:5]
 
 
+# Excel Photos cell: column N width 120, row capped at 409pt. The collage is
+# drawn at that exact pixel shell so the embed fills the cell with no margin.
+_PHOTO_SHELL_W = int(120.0 * 7.0 + 5) - 2
+_PHOTO_SHELL_H = int(409.0 * 96.0 / 72.0) - 2
+
+
 def _collage(
     paths: list[Path],
     out: Path,
     *,
     photo_numbers: list[int] | None = None,
     captions: dict[int, str] | None = None,
+    caption_texts: list[str] | None = None,
     cols: int = 4,
 ) -> Path:
-    """4-column contact sheet: every photo + original caption under each tile."""
+    """Contact sheet that fills the Excel Photos cell. Each photo fills its tile."""
     if not paths:
         raise ValueError("no photos for collage")
     nums = list(photo_numbers or [])
@@ -671,27 +867,30 @@ def _collage(
         nums.append(len(nums) + 1)
     captions = captions or {}
 
-    # >10 tiles always lock to 4 columns (4×N); 4–10 also 4-col; 1–3 stay narrow.
     cols = _collage_cols(len(paths)) if cols == 4 else max(1, min(4, len(paths), cols))
-    # Large tiles so Excel column-fill stays engineer-readable (file size OK).
-    if cols >= 4:
-        cell_w = 420 if len(paths) > 10 else 460
-    elif cols == 3:
-        cell_w = 480
-    else:
-        cell_w = 560
-    img_h = int(cell_w * 0.82)
-    caption_h = 88
-    tile_h = img_h + caption_h
-    pad = 6
-    font = _label_font(14)
-    tiles: list[Image.Image] = []
+    rows = (len(paths) + cols - 1) // cols
+    base_h, extra_h = divmod(_PHOTO_SHELL_H, rows)
+    # Each row's tiles share the full cell width, including a short last row.
+    tile_widths: list[int] = []
+    for r in range(rows):
+        n_in = min(cols, len(paths) - r * cols)
+        bw, ew = divmod(_PHOTO_SHELL_W, n_in)
+        for c in range(n_in):
+            tile_widths.append(bw + (ew if c == n_in - 1 else 0))
+    font = _label_font(13 if cols >= 3 else 15)
+    tiles: list[tuple[Image.Image, int, int]] = []
+    texts = list(caption_texts or [])
 
-    for path, num in zip(paths, nums):
+    for idx, (path, num) in enumerate(zip(paths, nums)):
+        r, _c = divmod(idx, cols)
+        cell_w = tile_widths[idx]
+        tile_h = base_h + (extra_h if r == rows - 1 else 0)
+        caption_h = max(44, min(92, tile_h // 4))
+        img_h = max(1, tile_h - caption_h)
         with Image.open(path) as src:
             src_im = src.convert("RGB")
-            # Cover-fit: fill the photo frame (crop center) — no empty gutters in-tile.
-            tw, th = cell_w - 4, img_h - 4
+            # Cover-fit: the photo fills its frame inside the cell shell.
+            tw, th = cell_w, img_h
             scale = max(tw / max(src_im.width, 1), th / max(src_im.height, 1))
             rw = max(1, int(src_im.width * scale))
             rh = max(1, int(src_im.height * scale))
@@ -700,32 +899,43 @@ def _collage(
             top = max(0, (rh - th) // 2)
             im = scaled.crop((left, top, left + tw, top + th))
         tile = Image.new("RGB", (cell_w, tile_h), (255, 255, 255))
-        tile.paste(im, (2, 2))
+        tile.paste(im, (0, 0))
         draw = ImageDraw.Draw(tile)
-        draw.rectangle([0, 0, cell_w - 1, img_h - 1], outline=(140, 140, 140), width=1)
         draw.rectangle(
             [0, img_h, cell_w - 1, tile_h - 1],
             fill=(245, 245, 245),
-            outline=(140, 140, 140),
+            outline=(90, 90, 90),
             width=1,
         )
         header = f"Photo #{int(num):02d}"
-        body = re.sub(r"\s+", " ", captions.get(int(num), "") or "").strip()
+        if idx < len(texts) and texts[idx]:
+            body = texts[idx]
+        else:
+            body = re.sub(r"\s+", " ", captions.get(int(num), "") or "").strip()
         body = re.sub(rf"(?i)^photo\s*#?\s*{int(num)}\s*:?\s*", "", body).strip(" -:")
         caption = f"{header}: {body}" if body else header
-        ty = img_h + 4
-        for line in _wrap_caption(caption, max_chars=max(28, cell_w // 8)):
-            draw.text((5, ty), line, fill=(20, 20, 20), font=font)
+        ty = img_h + 3
+        for line in _wrap_caption(caption, max_chars=max(22, cell_w // 7)):
+            if ty > tile_h - 14:
+                break
+            draw.text((4, ty), line, fill=(20, 20, 20), font=font)
             ty += 15
-        tiles.append(tile)
+        tiles.append((tile, cell_w, tile_h))
 
-    rows = (len(tiles) + cols - 1) // cols
-    width = cols * cell_w + (cols + 1) * pad
-    height = rows * tile_h + (rows + 1) * pad
-    canvas = Image.new("RGB", (width, height), (255, 255, 255))
-    for idx, tile in enumerate(tiles):
-        r, c = divmod(idx, cols)
-        canvas.paste(tile, (pad + c * (cell_w + pad), pad + r * (tile_h + pad)))
+    canvas = Image.new("RGB", (_PHOTO_SHELL_W, _PHOTO_SHELL_H), (255, 255, 255))
+    y = 0
+    for r in range(rows):
+        x = 0
+        row_h = 0
+        for c in range(cols):
+            idx = r * cols + c
+            if idx >= len(tiles):
+                break
+            tile, tw, th = tiles[idx]
+            canvas.paste(tile, (x, y))
+            x += tw
+            row_h = th
+        y += row_h
 
     out.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out, format="PNG", optimize=False)
@@ -856,7 +1066,7 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
         shots_dir.mkdir(parents=True, exist_ok=True)
         singles_dir.mkdir(parents=True, exist_ok=True)
 
-        photo_paths: list[Path] = []
+        paired_photos: list[PairedPhoto] = []
         # (page_index, optional iso y_band, allow_mixed)
         iso_jobs: list[tuple[int, tuple[float, float] | None, bool]] = []
         for i in range(doc.page_count):
@@ -867,13 +1077,13 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
                 continue
             shot = _render_page_shot(page, _SHOT_ZOOM)
             shot_path = shots_dir / f"{stem}_p{i + 1:02d}_{kind}.png"
-            shot.save(shot_path, format="PNG", optimize=True)
+            shot.save(shot_path, format="PNG", optimize=False)
 
             if kind == "iso_page":
                 iso_jobs.append((i, None, False))
                 continue
             if kind == "photo_page":
-                photo_paths.extend(
+                paired_photos.extend(
                     _crop_photos_from_shot(
                         page,
                         shot,
@@ -885,8 +1095,11 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
                 )
                 continue
             if kind == "mixed_page":
-                photo_band, iso_band = _mixed_band_fracs(page)
-                photo_paths.extend(
+                # Photos are above LINE NUMBER; ISO sketch starts at that label.
+                split = _line_split_frac(page) or 0.48
+                prep = _prepared_frac(page)
+                iso_bot = prep - 0.01 if prep and prep > split + 0.12 else 0.86
+                paired_photos.extend(
                     _crop_photos_from_shot(
                         page,
                         shot,
@@ -894,40 +1107,48 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
                         out_dir=singles_dir,
                         stem=stem,
                         page_index=i,
-                        y_band=photo_band,
+                        y_band=(0.08, max(0.20, split - 0.005)),
                     )
                 )
-                iso_jobs.append((i, iso_band, True))
+                iso_jobs.append((i, (split - 0.005, iso_bot), True))
 
-        # Dedupe identical screenshot crops; preserve page reading order.
-        uniq_paths: list[Path] = []
-        seen_sizes: set[tuple[int, int, int]] = set()
-        for path in photo_paths:
-            with Image.open(path) as im:
-                key = (im.size[0], im.size[1], path.stat().st_size)
-            if key in seen_sizes:
-                continue
-            seen_sizes.add(key)
-            uniq_paths.append(path)
+        # Keep every anomaly photo, in page reading order. Do not drop unpaired ones.
+        ordered = sorted(paired_photos, key=lambda p: p.path.name)
 
-        result.has_photos = bool(uniq_paths)
-        caption_by_num = _caption_map_from_bullets(result.caption_bullets)
-        if uniq_paths:
-            numbers = _assign_photo_numbers(
-                len(uniq_paths), caption_by_num, result.photo_refs
-            )
-            collage = photos_dir / f"{stem}_photos.png"
-            result.photo_paths = [
-                _collage(
-                    uniq_paths,
-                    collage,
-                    photo_numbers=numbers,
-                    captions=caption_by_num,
-                    cols=_collage_cols(len(uniq_paths)),
+        result.has_photos = bool(ordered)
+        text_caps = _caption_map_from_bullets(result.caption_bullets)
+        caption_texts: list[str] = []
+        for p in ordered:
+            body = (p.caption or text_caps.get(p.photo_num) or "").strip()
+            body = re.sub(r"\s+", " ", body)
+            body = re.sub(rf"(?i)\(?\s*Photo\s*#?\s*{p.photo_num}\s*\)?\s*$", "", body)
+            caption_texts.append(body.strip(" -:"))
+
+        if ordered:
+            bullets: list[str] = []
+            for p, body in zip(ordered, caption_texts):
+                line = (
+                    f"{body} (Photo #{p.photo_num:02d})"
+                    if body
+                    else f"Photo #{p.photo_num:02d}"
                 )
-            ]
-        else:
-            result.photo_paths = []
+                bullets.append(line)
+            result.caption_bullets = (
+                [f"-{b}" for b in bullets] if len(bullets) > 1 else bullets
+            )
+            result.photo_refs = _compress_photo_refs(
+                [
+                    PhotoRef(
+                        raw=f"{p.photo_num:02d}",
+                        start=p.photo_num,
+                        end=p.photo_num,
+                    )
+                    for p in ordered
+                ]
+            )
+
+        # Original crops only. Excel tiles them; nothing is resized here.
+        result.photo_paths = [p.path for p in ordered] if ordered else []
 
         # Prefer dedicated iso_page, then mixed_page sketch band (no anomaly tiles).
         pure_iso = [j for j in iso_jobs if not j[2]]
@@ -1103,6 +1324,8 @@ def build_edop_result(
         logger.info("Parsing line PDF SN=%s %s", sn, pdf_path.name)
         parsed = parse_line_pdf(pdf_path, work_dir / f"sn_{sn:03d}")
         summary = summary_by_sn.get(sn)
+        # Drop peak RSS between line PDFs (Railway OOM kills otherwise).
+        gc.collect()
 
         line_number = (
             (summary.line_number if summary else None)
@@ -1138,6 +1361,7 @@ def build_edop_result(
             pid_no=pid_no,
             photo_refs=parsed.photo_refs,
             photos_image_path=parsed.photo_paths[0] if parsed.photo_paths else None,
+            photo_image_paths=list(parsed.photo_paths),
             iso_image_path=parsed.iso_path,
             source=FindingSource(
                 section="edop_line_pdf",

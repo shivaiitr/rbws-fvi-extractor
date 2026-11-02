@@ -100,6 +100,8 @@ class Finding(BaseModel):
     iru: Optional[str] = None
     photo_refs: list[PhotoRef] = Field(default_factory=list)
     photos_image_path: Optional[Path] = None
+    # Original anomaly crops, in reading order. Excel tiles these inside the cell.
+    photo_image_paths: list[Path] = Field(default_factory=list)
     iso_image_path: Optional[Path] = None
     recommendations: Optional[str] = None
     remarks: Optional[str] = None

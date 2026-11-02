@@ -14,6 +14,7 @@ import streamlit as st
 from rbws_extractor.excel.writer import RbwsExcelWriter
 from rbws_extractor.ocr.edop_piping import build_edop_result, detect_pdf_kind
 from rbws_extractor.pipeline.ocr_pipeline import OcrPipeline
+from rbws_extractor.web_download import ensure_download_route, publish_workbook
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "quest-global-logo.svg"
 
@@ -336,6 +337,9 @@ def _render_footer() -> None:
 
 
 def _app_password() -> str:
+    # Local runs on this Mac skip the team password. Railway still uses APP_PASSWORD.
+    if os.environ.get("RBWS_LOCAL", "").strip() == "1":
+        return ""
     env = os.environ.get("APP_PASSWORD", "").strip()
     if env:
         return env
@@ -355,8 +359,18 @@ def _safe_pdf_name(raw: str) -> str:
 
 
 def _clear_workbook() -> None:
-    for key in ("excel_bytes", "excel_name", "findings_n", "warnings", "workflow_done"):
+    for key in (
+        "excel_bytes",
+        "excel_name",
+        "excel_token",
+        "findings_n",
+        "warnings",
+        "workflow_done",
+    ):
         st.session_state.pop(key, None)
+
+
+ensure_download_route()
 
 
 def _require_login() -> bool:
@@ -401,7 +415,8 @@ def _run_fire_water(uploaded, *, max_pages: int, skip_images: bool) -> None:
                 max_pages=int(max_pages),
                 skip_images=skip_images,
             )
-            st.session_state.excel_bytes = out_path.read_bytes()
+            _token = publish_workbook(out_path, out_path.name)
+            st.session_state.excel_token = _token
             st.session_state.excel_name = out_path.name
             st.session_state.findings_n = len(result.findings)
             st.session_state.warnings = list(result.warnings)
@@ -500,13 +515,15 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
             if skip_images:
                 for finding in result.findings:
                     finding.photos_image_path = None
+                    finding.photo_image_paths = []
                     finding.iso_image_path = None
             RbwsExcelWriter().write(
                 result,
                 out_path,
                 embed_images=not skip_images,
             )
-            st.session_state.excel_bytes = out_path.read_bytes()
+            _token = publish_workbook(out_path, out_path.name)
+            st.session_state.excel_token = _token
             st.session_state.excel_name = out_path.name
             st.session_state.findings_n = len(result.findings)
             st.session_state.warnings = (
@@ -754,12 +771,13 @@ else:
             unsafe_allow_html=True,
         )
 
-if st.session_state.get("excel_bytes"):
+if st.session_state.get("excel_token"):
     findings_n = st.session_state.get("findings_n", 0)
     done = st.session_state.get("workflow_done", "Job")
+    excel_name = st.session_state.get("excel_name", "workbook.xlsx")
     st.markdown(
         f'<p class="status-line"><em>Complete</em> · {done} · {findings_n} rows · '
-        f'{st.session_state.get("excel_name", "workbook.xlsx")}</p>',
+        f"{excel_name}</p>",
         unsafe_allow_html=True,
     )
     warnings = st.session_state.get("warnings") or []
@@ -767,11 +785,9 @@ if st.session_state.get("excel_bytes"):
         with st.expander("Extraction notes"):
             for warning in warnings:
                 st.write(f"- {warning}")
-    st.download_button(
-        label="Download RBWS Excel",
-        data=st.session_state.excel_bytes,
-        file_name=st.session_state.get("excel_name", "workbook.xlsx"),
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.link_button(
+        "Download RBWS Excel",
+        f"/rbws-download/{st.session_state.excel_token}",
     )
 
 _render_footer()
