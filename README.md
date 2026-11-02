@@ -1,3 +1,13 @@
+---
+title: RBWS FVI Extractor
+emoji: 📄
+colorFrom: purple
+colorTo: yellow
+sdk: docker
+app_port: 8501
+pinned: false
+---
+
 # RBWS FVI Extractor
 
 Local Python tool: **FVI Fire Water inspection PDF → RBWS Excel**.

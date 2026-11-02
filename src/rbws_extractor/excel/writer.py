@@ -8,8 +8,10 @@ from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.styles import Alignment, Border, Font, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.utils.units import pixels_to_EMU
 from PIL import Image as PILImage
 
 from rbws_extractor.logging_config import get_logger
@@ -52,8 +54,8 @@ GOLD_COL_WIDTHS = {
     "K": 8.6,
     "L": 7.0,
     "M": 13.0,
-    "N": 110.0,  # Photos — wide so 4×N tiles stay readable
-    "O": 78.0,  # ISO sketch
+    "N": 35.8,  # Photos — same shell as the manual EAP-GN workbook
+    "O": 36.4,  # ISO sketch
     "P": 50.8,
     "Q": 27.9,
 }
@@ -62,10 +64,10 @@ GOLD_COL_WIDTHS = {
 _PHOTO_COL = 14  # N
 _ISO_COL = 15  # O
 
-# Excel clamps row height near 409pt — use the full budget for engineer review.
-_MIN_IMG_ROW_PT = 200.0
+# Excel clamps row height near 409pt.
 _MAX_IMG_ROW_PT = 409.0
-_CELL_PAD_PX = 4
+# Pictures sit inside the cell with a small margin, aspect locked.
+_CELL_INSET = 0.04
 
 THIN = Border(
     left=Side(style="thin", color="B0B0B0"),
@@ -105,11 +107,11 @@ def _finding_row_values(finding: Finding) -> list[Any]:
 
 
 def _col_width_to_px(width_chars: float) -> int:
-    """Approximate Excel column width (character units) → screen pixels."""
-    return max(40, int(width_chars * 7.0 + 5))
+    """Excel column width (character units) → pixels at 96 DPI, Calibri 11."""
+    return max(40, int(((256 * width_chars + int(128 / 7)) / 256) * 7))
 
 
-def _px_to_row_points(height_px: int) -> float:
+def _px_to_row_points(height_px: float) -> float:
     """Convert image pixel height to Excel row-height points (96 DPI)."""
     return height_px * 72.0 / 96.0
 
@@ -143,10 +145,9 @@ class RbwsExcelWriter:
             cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
             cell.border = THIN
 
-        photo_max_w = _col_width_to_px(GOLD_COL_WIDTHS["N"]) - _CELL_PAD_PX
-        iso_max_w = _col_width_to_px(GOLD_COL_WIDTHS["O"]) - _CELL_PAD_PX
-        # Excel row-height ceiling in pixels; used only as a soft display cap.
-        fit_budget_h = int(_MAX_IMG_ROW_PT * 96.0 / 72.0) - _CELL_PAD_PX
+        photo_max_w = _col_width_to_px(GOLD_COL_WIDTHS["N"])
+        iso_max_w = _col_width_to_px(GOLD_COL_WIDTHS["O"])
+        fit_budget_h = int(_MAX_IMG_ROW_PT * 96.0 / 72.0)
 
         data_start = 3
         for offset, finding in enumerate(result.findings):
@@ -162,23 +163,30 @@ class RbwsExcelWriter:
 
             display_heights: list[float] = []
             if embed_images:
-                ph = self._embed_image(
+                photo_paths = [
+                    Path(p)
+                    for p in (finding.photo_image_paths or [])
+                    if p and Path(p).exists()
+                ]
+                if not photo_paths and finding.photos_image_path:
+                    photo_paths = [Path(finding.photos_image_path)]
+                ph = self._place_images(
                     ws,
                     row_idx,
                     col=_PHOTO_COL,
-                    path=finding.photos_image_path,
+                    paths=photo_paths,
                     max_w=photo_max_w,
                     max_h=fit_budget_h,
-                    fill_width=True,
+                    columns=2,
                 )
-                ih = self._embed_image(
+                ih = self._place_images(
                     ws,
                     row_idx,
                     col=_ISO_COL,
-                    path=finding.iso_image_path,
+                    paths=[Path(finding.iso_image_path)] if finding.iso_image_path else [],
                     max_w=iso_max_w,
                     max_h=fit_budget_h,
-                    fill_width=True,
+                    columns=1,
                 )
                 if ph:
                     display_heights.append(ph)
@@ -186,13 +194,13 @@ class RbwsExcelWriter:
                     display_heights.append(ih)
 
             if display_heights:
-                # Match row height to the embedded image (Excel clamps ~409pt).
-                needed = max(display_heights) + 6.0
+                text = finding.anomaly_description or ""
+                text_need = 36.0 + max(1, text.count("\n") + 1) * 14.0
+                needed = max(display_heights) + 8.0
                 ws.row_dimensions[row_idx].height = min(
-                    _MAX_IMG_ROW_PT, max(_MIN_IMG_ROW_PT, needed)
+                    _MAX_IMG_ROW_PT, max(needed, min(text_need, _MAX_IMG_ROW_PT))
                 )
             else:
-                # Text-only / no-data rows stay compact.
                 text = finding.anomaly_description or ""
                 lines = max(2, text.count("\n") + 1)
                 ws.row_dimensions[row_idx].height = min(120.0, 36.0 + lines * 14.0)
@@ -220,67 +228,70 @@ class RbwsExcelWriter:
         return output_path
 
     @staticmethod
-    def _embed_image(
+    def _place_images(
         ws,
         row_idx: int,
         col: int,
-        path: Path | None,
+        paths: list[Path],
         *,
         max_w: int,
         max_h: int,
-        fill_width: bool = True,
+        columns: int,
     ) -> float | None:
-        """Embed image filling the column width (no side gaps). Returns height in points."""
-        if path is None or not Path(path).exists():
+        """Tile original images inside the cell. Display size only; files stay full resolution."""
+        existing = [Path(p) for p in paths if p and Path(p).exists()]
+        if not existing:
             return None
         try:
-            src = Path(path)
-            with PILImage.open(src) as im:
-                im = im.convert("RGB")
-                if fill_width:
-                    # Stretch to column width; keep aspect. Upscale when source is small
-                    # so tiles stay recognizable for engineers.
-                    scale = max_w / max(im.width, 1)
-                    new_w = max_w
-                    new_h = max(1, int(im.height * scale))
-                    # If taller than Excel's practical row budget, scale to that height
-                    # while still preferring as much width as possible.
-                    if new_h > max_h:
-                        scale_h = max_h / max(im.height, 1)
-                        scale_w = max_w / max(im.width, 1)
-                        # Prefer width fill when aspect is landscape; otherwise height cap.
-                        if im.width >= im.height:
-                            scale = scale_w
-                            new_w = max_w
-                            new_h = max(1, int(im.height * scale))
-                            if new_h > max_h:
-                                new_h = max_h
-                                new_w = max(1, int(im.width * (max_h / max(im.height, 1))))
-                                new_w = min(new_w, max_w)
-                        else:
-                            scale = min(scale_w, scale_h)
-                            new_w = max(1, int(im.width * scale))
-                            new_h = max(1, int(im.height * scale))
-                    im = im.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
-                else:
-                    scale = min(max_w / max(im.width, 1), max_h / max(im.height, 1))
-                    new_w = max(1, int(im.width * scale))
-                    new_h = max(1, int(im.height * scale))
-                    im = im.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+            natives: list[tuple[Path, int, int]] = []
+            for path in existing:
+                with PILImage.open(path) as im:
+                    natives.append((path, im.width, im.height))
 
-                # No letterbox — image is the embed (avoids empty side gutters).
-                fitted = src.with_name(f"{src.stem}_cell{src.suffix}")
-                im.save(fitted, format="PNG", optimize=False)
-                display_w, display_h_px = im.size
+            cols = 1 if len(natives) == 1 else max(1, columns)
+            inset = max(2, int(max_w * _CELL_INSET))
+            inner_w = max(40, max_w - 2 * inset)
+            gap = 6 if cols > 1 else 0
+            tile_w = (inner_w - gap * (cols - 1)) / cols
 
-            img = XLImage(str(fitted))
-            img.width = display_w
-            img.height = display_h_px
-            img.anchor = f"{get_column_letter(col)}{row_idx}"
-            ws.add_image(img)
-            return _px_to_row_points(display_h_px)
+            placed: list[tuple[Path, int, int, int, int]] = []
+            y = inset
+            row_h = 0
+            for idx, (path, nw, nh) in enumerate(natives):
+                if idx % cols == 0:
+                    y += row_h + (gap if idx else 0)
+                    row_h = 0
+                scale = min(1.0, tile_w / max(nw, 1))
+                dw = max(1, int(nw * scale))
+                dh = max(1, int(nh * scale))
+                x = inset + (idx % cols) * (int(tile_w) + gap)
+                placed.append((path, x, y, dw, dh))
+                row_h = max(row_h, dh)
+            total_h = y + row_h + inset
+
+            if total_h > max_h:
+                shrink = max_h / total_h
+                placed = [
+                    (path, int(x * shrink), int(y * shrink), max(1, int(dw * shrink)), max(1, int(dh * shrink)))
+                    for path, x, y, dw, dh in placed
+                ]
+                total_h = max_h
+
+            for path, x, y, dw, dh in placed:
+                img = XLImage(str(path))
+                img.anchor = OneCellAnchor(
+                    _from=AnchorMarker(
+                        col=col - 1,
+                        colOff=pixels_to_EMU(x),
+                        row=row_idx - 1,
+                        rowOff=pixels_to_EMU(y),
+                    ),
+                    ext=XDRPositiveSize2D(cx=pixels_to_EMU(dw), cy=pixels_to_EMU(dh)),
+                )
+                ws.add_image(img)
+            return _px_to_row_points(total_h)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed embedding image %s at %s: %s", path, row_idx, exc)
+            logger.warning("Failed placing images at row %s: %s", row_idx, exc)
             return None
 
     @staticmethod
