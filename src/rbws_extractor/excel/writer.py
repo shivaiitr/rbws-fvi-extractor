@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,8 @@ _ISO_COL = 15  # O
 _MAX_IMG_ROW_PT = 409.0
 # Pictures sit inside the cell with a small margin, aspect locked.
 _CELL_INSET = 0.04
+_GRID_INSET = 8
+_GRID_GAP = 6
 
 THIN = Border(
     left=Side(style="thin", color="B0B0B0"),
@@ -116,6 +120,39 @@ def _px_to_row_points(height_px: float) -> float:
     return height_px * 72.0 / 96.0
 
 
+def _sheet_title(name: str, taken: set[str] | None = None) -> str:
+    """Excel sheet names are at most 31 characters and must be unique in the workbook."""
+    cleaned = re.sub(r"[\[\]:*?/\\]", " ", name or "RBWS")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip() or "RBWS"
+    base = cleaned[:31]
+    used = taken or set()
+    if base not in used:
+        return base
+    for number in range(2, 50):
+        suffix = f" {number}"
+        candidate = base[: 31 - len(suffix)] + suffix
+        if candidate not in used:
+            return candidate
+    return base[:28] + " x"
+
+
+def _px_to_col_width(px: int) -> float:
+    """Pixels at 96 DPI back to an Excel column width that can hold them."""
+    width = ((px + 2) * 256 / 7 - int(128 / 7)) / 256
+    return max(GOLD_COL_WIDTHS["N"], round(width, 2))
+
+
+def photo_grid_columns(count: int, tile_h: int, max_h: int) -> int:
+    """2 across while the photos fit at their own size. 4 across when a 2-grid would shrink them."""
+    if count <= 1:
+        return 1
+    rows = (count + 1) // 2
+    height = _GRID_INSET * 2 + rows * tile_h + max(0, rows - 1) * _GRID_GAP
+    if height <= max_h:
+        return 2
+    return 4
+
+
 class RbwsExcelWriter:
     """Write ExtractionResult to an OpenPyXL workbook."""
 
@@ -128,18 +165,28 @@ class RbwsExcelWriter:
         output_path: Path,
         embed_images: bool = True,
         include_pof_note: bool = True,
+        workbook: Workbook | None = None,
+        save: bool = True,
     ) -> Path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        wb = Workbook()
-        ws = wb.active
+        own_book = workbook is None
+        wb = workbook if workbook is not None else Workbook()
         facility = result.metadata.facility or "RBWS"
-        ws.title = facility[:31]
+        if own_book:
+            ws = wb.active
+            ws.title = _sheet_title(facility)
+        else:
+            ws = wb.create_sheet(_sheet_title(facility, taken={sheet.title for sheet in wb.worksheets}))
 
         # Header row at row 2 to match gold workbook.
         ws.row_dimensions[2].height = 55.5
-        for col_idx, header in enumerate(HEADERS, start=2):
+        headers = list(HEADERS)
+        if result.metadata.layout == "pressure_vessel":
+            headers[2] = "Equipment #"
+            headers[4] = "Equipment Description"
+        for col_idx, header in enumerate(headers, start=2):
             cell = ws.cell(row=2, column=col_idx, value=header)
             cell.font = Font(bold=True, size=11, name="Calibri")
             cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
@@ -148,6 +195,8 @@ class RbwsExcelWriter:
         photo_max_w = _col_width_to_px(GOLD_COL_WIDTHS["N"])
         iso_max_w = _col_width_to_px(GOLD_COL_WIDTHS["O"])
         fit_budget_h = int(_MAX_IMG_ROW_PT * 96.0 / 72.0)
+        vessel = result.metadata.layout == "pressure_vessel"
+        vessel_photo_px = photo_max_w
 
         data_start = 3
         for offset, finding in enumerate(result.findings):
@@ -170,15 +219,24 @@ class RbwsExcelWriter:
                 ]
                 if not photo_paths and finding.photos_image_path:
                     photo_paths = [Path(finding.photos_image_path)]
-                ph = self._place_images(
-                    ws,
-                    row_idx,
-                    col=_PHOTO_COL,
-                    paths=photo_paths,
-                    max_w=photo_max_w,
-                    max_h=fit_budget_h,
-                    columns=2,
-                )
+                if vessel:
+                    ph, used_w = self._place_vessel_photos(
+                        ws,
+                        row_idx,
+                        photo_paths,
+                        max_h=fit_budget_h,
+                    )
+                    vessel_photo_px = max(vessel_photo_px, used_w)
+                else:
+                    ph = self._place_images(
+                        ws,
+                        row_idx,
+                        col=_PHOTO_COL,
+                        paths=photo_paths,
+                        max_w=photo_max_w,
+                        max_h=fit_budget_h,
+                        columns=2,
+                    )
                 ih = self._place_images(
                     ws,
                     row_idx,
@@ -219,9 +277,12 @@ class RbwsExcelWriter:
                 )
 
         self._set_column_widths(ws)
+        if vessel:
+            ws.column_dimensions["N"].width = _px_to_col_width(vessel_photo_px)
         ws.freeze_panes = "B3"
         ws.print_title_rows = "2:2"
-        wb.save(output_path)
+        if save:
+            wb.save(output_path)
         logger.info(
             "Wrote RBWS workbook: %s (%s findings)", output_path, len(result.findings)
         )
@@ -294,7 +355,83 @@ class RbwsExcelWriter:
             logger.warning("Failed placing images at row %s: %s", row_idx, exc)
             return None
 
+    def _place_vessel_photos(
+        self,
+        ws,
+        row_idx: int,
+        paths: list[Path],
+        *,
+        max_h: int,
+    ) -> tuple[float | None, int]:
+        """Place each PDF photo once, at its own pixels, 4 across only when 2 across would shrink it."""
+        existing = [Path(p) for p in paths if p and Path(p).exists()]
+        if not existing:
+            return None, 0
+        try:
+            natives: list[tuple[Path, int, int]] = []
+            seen_hash: set[bytes] = set()
+            for path in existing:
+                digest = hashlib.sha256(path.read_bytes()).digest()
+                if digest in seen_hash:
+                    continue
+                seen_hash.add(digest)
+                with PILImage.open(path) as im:
+                    natives.append((path, im.width, im.height))
+            if not natives:
+                return None, 0
+            tile_h = max(nh for _, _, nh in natives)
+            cols = photo_grid_columns(len(natives), tile_h, max_h)
+            placed, total_h, content_w = _pack_native(natives, cols)
+            if total_h > max_h:
+                shrink = max_h / total_h
+                placed = [
+                    (path, int(x * shrink), int(y * shrink), max(1, int(dw * shrink)), max(1, int(dh * shrink)))
+                    for path, x, y, dw, dh in placed
+                ]
+                total_h = max_h
+                content_w = max(1, int(content_w * shrink))
+            for path, x, y, dw, dh in placed:
+                img = XLImage(str(path))
+                img.anchor = OneCellAnchor(
+                    _from=AnchorMarker(
+                        col=_PHOTO_COL - 1,
+                        colOff=pixels_to_EMU(x),
+                        row=row_idx - 1,
+                        rowOff=pixels_to_EMU(y),
+                    ),
+                    ext=XDRPositiveSize2D(cx=pixels_to_EMU(dw), cy=pixels_to_EMU(dh)),
+                )
+                ws.add_image(img)
+            return _px_to_row_points(total_h), content_w
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed placing vessel photos at row %s: %s", row_idx, exc)
+            return None, 0
+
     @staticmethod
     def _set_column_widths(ws) -> None:
         for letter, width in GOLD_COL_WIDTHS.items():
             ws.column_dimensions[letter].width = width
+
+
+def _pack_native(
+    natives: list[tuple[Path, int, int]],
+    cols: int,
+) -> tuple[list[tuple[Path, int, int, int, int]], int, int]:
+    """Lay photos out at their own pixel size. No resample."""
+    gap = _GRID_GAP if cols > 1 else 0
+    rows = [natives[i : i + cols] for i in range(0, len(natives), cols)]
+    placed: list[tuple[Path, int, int, int, int]] = []
+    y = _GRID_INSET
+    content_w = 0
+    row_h = 0
+    for row in rows:
+        tile_w = max(nw for _, nw, _ in row)
+        row_h = max(nh for _, _, nh in row)
+        x = _GRID_INSET
+        for path, nw, nh in row:
+            placed.append((path, x, y, nw, nh))
+            x += tile_w + gap
+        content_w = max(content_w, x - gap + _GRID_INSET)
+        y += row_h + gap
+    total_h = y - gap + _GRID_INSET
+    return placed, total_h, content_w

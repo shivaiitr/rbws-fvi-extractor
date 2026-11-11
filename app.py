@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import io
 import os
 import tempfile
@@ -13,6 +14,7 @@ import streamlit as st
 
 from rbws_extractor.excel.writer import RbwsExcelWriter
 from rbws_extractor.ocr.edop_piping import build_edop_result, detect_pdf_kind
+from rbws_extractor.ocr.vessel import build_vessel_result
 from rbws_extractor.pipeline.ocr_pipeline import OcrPipeline
 from rbws_extractor.web_download import ensure_download_route, publish_workbook
 
@@ -115,9 +117,9 @@ header[data-testid="stHeader"] {
 }
 .workflow-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
     gap: 0;
-    margin: 0 0 1.25rem;
+    margin: 0 0 0.35rem;
     background: #fff;
     border-bottom: 1px solid #e3d7de;
 }
@@ -211,6 +213,76 @@ header[data-testid="stHeader"] {
     border-top: 3px solid #ffd100;
 }
 .qg-footer strong { color: #ffd100; font-weight: 700; }
+.job {
+    display: flex;
+    align-items: center;
+    gap: 1.15rem;
+    margin: 0.85rem 0 1rem;
+    padding: 0.95rem 1.15rem;
+    background: #fff;
+    border: 1px solid #e3d7de;
+    border-left: 4px solid #662a53;
+}
+.job.is-done { border-left-color: #ffd100; }
+.job-ring {
+    position: relative;
+    width: 92px;
+    height: 92px;
+    flex: 0 0 auto;
+}
+.job-ring svg {
+    width: 92px;
+    height: 92px;
+    transform: rotate(-90deg);
+}
+.job-track { fill: none; stroke: #efe6ea; stroke-width: 8; }
+.job-value { fill: none; stroke: #662a53; stroke-width: 8; }
+.job.is-done .job-value { stroke: #662a53; }
+.job-ring span {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #662a53;
+    font-weight: 700;
+    font-size: 1.05rem;
+}
+.job-kicker {
+    margin: 0;
+    color: #662a53;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+.job-label {
+    margin: 0.28rem 0 0;
+    color: #241820;
+    font-size: 1rem;
+    line-height: 1.35;
+}
+.spec-bar {
+    margin: 0 0 1.15rem;
+    padding: 0.45rem 2rem;
+    background: #f7f4f5;
+    border-bottom: 1px solid #e3d7de;
+    color: #5c4e55;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.spec-bar strong { color: #662a53; font-weight: 700; }
+div[data-testid="stWidgetLabel"] p,
+div[data-testid="stFileUploader"] label p {
+    color: #662a53;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 0.84rem;
+}
+div[data-testid="stRadio"] label[data-baseweb="radio"] {
+    color: #241820;
+}
 div[data-testid="stFileUploader"] section {
     background: #fff;
     border: 1px solid #d9ccd2;
@@ -257,6 +329,9 @@ button[data-testid="stBaseButton-primary"]:hover {
     color: #662a53;
     border: 1px solid #e6bc00;
 }
+@media (max-width: 1100px) {
+    .workflow-grid { grid-template-columns: 1fr; }
+}
 @media (max-width: 900px) {
     .mast, .workflow-grid { grid-template-columns: 1fr; }
     .mast-meta { text-align: left; }
@@ -269,9 +344,11 @@ button[data-testid="stBaseButton-primary"]:hover {
 </style>
 """
 
-WORKFLOW_AUTO = "Auto · detect from upload"
-WORKFLOW_FIRE_WATER = "Workflow A · Fire Water FVI (single PDF)"
-WORKFLOW_EDOP = "Workflow B · Process Piping (summary + line PDFs)"
+WORKFLOW_AUTO = "Automatic classification"
+WORKFLOW_FIRE_WATER = "Procedure A · Fire water FVI"
+WORKFLOW_EDOP = "Procedure B · Process piping"
+# Separate from Auto / A / B. Rename this string to rename the flow in the UI.
+WORKFLOW_VESSEL = "Pressure vessel workflow"
 
 
 def _logo_html() -> str:
@@ -284,7 +361,7 @@ def _logo_html() -> str:
     )
 
 
-def _render_chrome() -> None:
+def _render_mast() -> None:
     st.markdown(QG_CSS, unsafe_allow_html=True)
     st.markdown(
         f"""
@@ -292,48 +369,133 @@ def _render_chrome() -> None:
             <div>{_logo_html()}</div>
             <div>
                 <p class="mast-kicker">Quest Global Engineering Services Limited</p>
-                <h1>RBWS FVI Extractor</h1>
-                <p class="mast-sub">General RBWS extractor for Fire Water and Process Piping FVI packs. Local OCR/rules only — no LLM calls.</p>
+                <h1>RBWS FVI Workbook Generator</h1>
+                <p class="mast-sub">Full visual inspection reports issued as the standard RBWS workbook. Rules-based extraction. No external language models.</p>
             </div>
             <div class="mast-meta">
-                <strong>Auto</strong>
-                Detect from upload
-                <strong>A / B</strong>
-                Fire Water · Piping
+                <strong>Procedures</strong>
+                A · Fire water
+                <strong>B · C</strong>
+                Piping · Vessels
+                <strong>Built by</strong>
+                Shivendra Jaiswal
             </div>
         </header>
-        <section class="workflow-grid">
-            <div class="workflow-card">
-                <span class="idx">A</span>
-                <strong>Fire Water FVI (e.g. UBIT-GP)</strong>
-                <p>One Jimcel Fire Water inspection PDF. Upload that report only.</p>
-                <ul>
-                    <li>Observation tables → one row per item</li>
-                    <li>Photos / ISO crops embedded</li>
-                    <li>Judgment columns left blank</li>
-                </ul>
-            </div>
-            <div class="workflow-card">
-                <span class="idx">B</span>
-                <strong>Process Piping (e.g. EDOP-QP, EAP-GN)</strong>
-                <p>Summary checklist PDF <em>plus</em> one PDF per line number (or a zip).</p>
-                <ul>
-                    <li>Summary → Line Description (From–To) when checklist parses</li>
-                    <li>Line PDF → anomaly under images + photo / ISO crops</li>
-                    <li>Wrong slot? Use <em>Auto</em> — we detect Fire Water vs Piping</li>
-                </ul>
-            </div>
-        </section>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _render_footer() -> None:
+def _render_procedures() -> None:
     st.markdown(
-        '<p class="qg-footer">Quest Global Engineering Services Limited · <strong>Built by Shivendra</strong></p>',
+        """
+        <section class="workflow-grid">
+            <div class="workflow-card">
+                <span class="idx">A</span>
+                <strong>Fire water systems</strong>
+                <p>One inspection report. Each observation is one workbook row.</p>
+                <ul>
+                    <li>Visual inspection tables are the master list</li>
+                    <li>Photographs and isometric sketches are placed in the sheet</li>
+                    <li>Judgment columns remain blank for engineering review</li>
+                </ul>
+            </div>
+            <div class="workflow-card">
+                <span class="idx">B</span>
+                <strong>Process piping</strong>
+                <p>Summary checklist, plus one document per line or a single archive.</p>
+                <ul>
+                    <li>Line description is taken from the checklist From–To text</li>
+                    <li>Anomaly text and photographs are taken from each line document</li>
+                    <li>Uncertain classification is handled by automatic selection</li>
+                </ul>
+            </div>
+            <div class="workflow-card">
+                <span class="idx">C</span>
+                <strong>Pressure vessels and tanks</strong>
+                <p>One or more vessel reports, from any facility.</p>
+                <ul>
+                    <li>Summary of findings is the master equipment list</li>
+                    <li>Each photograph keeps the caption printed beneath it</li>
+                    <li>Probability of failure and recommendations remain blank</li>
+                </ul>
+            </div>
+        </section>
+        <p class="spec-bar"><strong>Deliverable</strong> · RBWS workbook · Source photograph resolution retained · Judgment fields left blank</p>
+        """,
         unsafe_allow_html=True,
     )
+
+
+def _render_chrome() -> None:
+    _render_mast()
+    _render_procedures()
+
+
+def _render_footer() -> None:
+    st.markdown(
+        '<p class="qg-footer">Quest Global Engineering Services Limited · <strong>RBWS FVI Workbook Generator</strong> · Built by Shivendra Jaiswal</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def _ring_html(pct: int, label: str, *, done: bool = False) -> str:
+    pct = max(0, min(100, int(pct)))
+    radius = 42
+    circ = 2 * 3.14159265 * radius
+    offset = circ * (1 - pct / 100)
+    state = " is-done" if done or pct >= 100 else ""
+    kicker = "Workbook complete" if done or pct >= 100 else "Job in progress"
+    safe_label = html.escape(label)
+    return (
+        f'<div class="job{state}">'
+        f'<div class="job-ring" role="progressbar" aria-valuenow="{pct}" '
+        f'aria-valuemin="0" aria-valuemax="100" aria-label="{safe_label}">'
+        f'<svg viewBox="0 0 100 100" aria-hidden="true">'
+        f'<circle class="job-track" cx="50" cy="50" r="{radius}" />'
+        f'<circle class="job-value" cx="50" cy="50" r="{radius}" '
+        f'stroke-dasharray="{circ:.2f}" stroke-dashoffset="{offset:.2f}" />'
+        f"</svg><span>{pct}%</span></div>"
+        f'<div class="job-copy"><p class="job-kicker">{kicker}</p>'
+        f'<p class="job-label">{safe_label}</p></div></div>'
+    )
+
+
+class _JobMeter:
+    """Circular completion indicator. Updated from the job stages in this screen."""
+
+    def __init__(self) -> None:
+        self._slot = st.empty()
+
+    def update(self, pct: int, label: str) -> None:
+        self._slot.markdown(_ring_html(pct, label), unsafe_allow_html=True)
+
+    def complete(self, label: str = "The workbook is ready for download.") -> None:
+        self._slot.markdown(_ring_html(100, label, done=True), unsafe_allow_html=True)
+
+    def clear(self) -> None:
+        self._slot.empty()
+
+
+def _watch_steps(meter: _JobMeter):
+    """Map a stage counter onto the ring, leaving the last slice for completion."""
+
+    def _on(done: int, total: int, label: str) -> None:
+        fraction = 0.0 if total <= 0 else done / total
+        meter.update(4 + int(96 * fraction), label)
+
+    return _on
+
+
+def _watch_portion(meter: _JobMeter, *, file_index: int, file_count: int):
+    """Map one file's stages into its share of a multi-file job."""
+
+    def _on(done: int, total: int, label: str) -> None:
+        inner = 0.0 if total <= 0 else done / total
+        overall = (file_index + inner) / max(file_count, 1)
+        meter.update(4 + int(88 * overall), label)
+
+    return _on
 
 
 def _app_password() -> str:
@@ -379,20 +541,20 @@ def _require_login() -> bool:
         return True
     if st.session_state.get("authenticated"):
         return True
-    _render_chrome()
+    _render_mast()
     st.markdown(
-        '<p class="panel-label">Controlled access</p><p class="work-title">Team sign-in</p>',
+        '<p class="panel-label">Access control</p><p class="work-title">Authorized sign-in</p>',
         unsafe_allow_html=True,
     )
-    password = st.text_input("Shared password", type="password")
-    if st.button("Enter", type="primary"):
+    password = st.text_input("Team password", type="password")
+    if st.button("Sign in", type="primary"):
         if not password.strip():
-            st.error("Enter the password.")
+            st.error("Enter the team password.")
         elif password == password_expected:
             st.session_state.authenticated = True
             st.rerun()
         else:
-            st.error("The password does not match.")
+            st.error("The password is not recognized.")
     _render_footer()
     return False
 
@@ -405,15 +567,16 @@ def _run_fire_water(uploaded, *, max_pages: int, skip_images: bool) -> None:
         pdf_path.write_bytes(uploaded.getvalue())
         out_path = temp_dir / f"{pdf_path.stem}_RBWS.xlsx"
         work_dir = temp_dir / "work"
-        with st.spinner(
-            f"Workflow A · extracting {safe_name}. Large Fire Water reports can take several minutes."
-        ):
+        meter = _JobMeter()
+        try:
+            meter.update(4, f"Document accepted · {safe_name}")
             result = OcrPipeline().run(
                 pdf_path=pdf_path,
                 output_xlsx=out_path,
                 work_dir=work_dir,
                 max_pages=int(max_pages),
                 skip_images=skip_images,
+                on_progress=_watch_steps(meter),
             )
             _token = publish_workbook(out_path, out_path.name)
             st.session_state.excel_token = _token
@@ -421,6 +584,10 @@ def _run_fire_water(uploaded, *, max_pages: int, skip_images: bool) -> None:
             st.session_state.findings_n = len(result.findings)
             st.session_state.warnings = list(result.warnings)
             st.session_state.workflow_done = WORKFLOW_FIRE_WATER
+            meter.complete(f"Procedure A complete · {len(result.findings)} rows · {out_path.name}")
+        except Exception:
+            meter.clear()
+            raise
 
 
 def _save_line_uploads(line_files, line_zips, line_dir: Path) -> tuple[int, list[str]]:
@@ -477,7 +644,7 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
         summary_path = temp_dir / summary_name
         summary_bytes = summary_file.getvalue()
         if len(summary_bytes) < 1000:
-            raise ValueError("Summary PDF upload is empty. Re-upload the summary report.")
+            raise ValueError("The summary document is empty. Submit the summary report again.")
         summary_path.write_bytes(summary_bytes)
 
         line_dir = temp_dir / "lines"
@@ -489,34 +656,36 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
         # → route to Workflow A instead of failing on checklist parse.
         if saved == 0 and kind == "fire_water":
             st.info(
-                "Detected a Fire Water FVI report in the summary slot — "
-                "running Workflow A automatically."
+                "The submitted document is a fire water inspection report. "
+                "It will be processed under Procedure A."
             )
             _run_fire_water(summary_file, max_pages=0, skip_images=skip_images)
             return
 
         if saved == 0:
             raise ValueError(
-                "No line-number PDFs were saved. For Process Piping, upload the "
-                "per-line PDFs (or a .zip). For a single Fire Water report, use "
-                "Workflow A / Auto."
+                "No line documents were received. For process piping, submit the "
+                "line documents or one archive. For a single fire water report, "
+                "use Procedure A or automatic classification."
             )
 
         out_path = temp_dir / "ProcessPiping_RBWS_REVIEW.xlsx"
         work_dir = temp_dir / "work"
-        with st.spinner(
-            f"Workflow B · summary + {saved} line PDF(s). This can take several minutes."
-        ):
+        meter = _JobMeter()
+        try:
+            meter.update(4, f"Summary accepted · {saved} line document(s)")
             result = build_edop_result(
                 summary_pdf=summary_path,
                 line_pdf_dir=line_dir,
                 work_dir=work_dir,
+                on_progress=_watch_portion(meter, file_index=0, file_count=1),
             )
             if skip_images:
                 for finding in result.findings:
                     finding.photos_image_path = None
                     finding.photo_image_paths = []
                     finding.iso_image_path = None
+            meter.update(94, "Writing the workbook")
             RbwsExcelWriter().write(
                 result,
                 out_path,
@@ -531,6 +700,98 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
             )
             st.session_state.workflow_done = WORKFLOW_EDOP
             st.session_state.edop_saved_lines = saved
+            meter.complete(
+                f"Procedure B complete · {len(result.findings)} rows · {out_path.name}"
+            )
+        except Exception:
+            meter.clear()
+            raise
+
+
+def _run_vessel(uploaded, *, skip_images: bool) -> None:
+    """Pressure vessel workflow. One or more PDFs. Does not call Workflow A or B."""
+    files = uploaded if isinstance(uploaded, list) else [uploaded]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+        meter = _JobMeter()
+        try:
+            meter.update(4, f"{len(files)} report(s) accepted")
+            if len(files) == 1:
+                uploaded_one = files[0]
+                safe_name = _safe_pdf_name(uploaded_one.name)
+                pdf_path = temp_dir / safe_name
+                pdf_path.write_bytes(uploaded_one.getvalue())
+                out_path = temp_dir / f"{pdf_path.stem}_RBWS.xlsx"
+                result = build_vessel_result(
+                    pdf_path,
+                    temp_dir / "work",
+                    on_progress=_watch_portion(meter, file_index=0, file_count=1),
+                )
+                if skip_images:
+                    for finding in result.findings:
+                        finding.photos_image_path = None
+                        finding.photo_image_paths = []
+                        finding.iso_image_path = None
+                meter.update(94, "Writing the workbook")
+                RbwsExcelWriter().write(
+                    result,
+                    out_path,
+                    embed_images=not skip_images,
+                    include_pof_note=False,
+                )
+                findings_n = len(result.findings)
+                warnings = list(result.warnings)
+                excel_name = out_path.name
+            else:
+                from openpyxl import Workbook
+
+                wb = Workbook()
+                writer = RbwsExcelWriter()
+                findings_n = 0
+                warnings = []
+                file_count = len(files)
+                for index, item in enumerate(files):
+                    safe_name = _safe_pdf_name(item.name)
+                    pdf_path = temp_dir / f"{index + 1:02d}_{safe_name}"
+                    pdf_path.write_bytes(item.getvalue())
+                    result = build_vessel_result(
+                        pdf_path,
+                        temp_dir / f"work_{index + 1}",
+                        on_progress=_watch_portion(
+                            meter, file_index=index, file_count=file_count
+                        ),
+                    )
+                    if skip_images:
+                        for finding in result.findings:
+                            finding.photos_image_path = None
+                            finding.photo_image_paths = []
+                            finding.iso_image_path = None
+                    writer.write(
+                        result,
+                        temp_dir / "vessel_RBWS.xlsx",
+                        embed_images=not skip_images,
+                        include_pof_note=False,
+                        workbook=wb,
+                        save=False,
+                    )
+                    findings_n += len(result.findings)
+                    warnings.extend(f"{safe_name}: {note}" for note in result.warnings)
+                if len(wb.worksheets) > 1:
+                    wb.remove(wb.worksheets[0])
+                meter.update(94, "Writing the workbook")
+                out_path = temp_dir / "Pressure_vessel_RBWS.xlsx"
+                wb.save(out_path)
+                excel_name = out_path.name
+            _token = publish_workbook(out_path, excel_name)
+            st.session_state.excel_token = _token
+            st.session_state.excel_name = excel_name
+            st.session_state.findings_n = findings_n
+            st.session_state.warnings = warnings
+            st.session_state.workflow_done = WORKFLOW_VESSEL
+            meter.complete(f"Pressure vessel workflow complete · {findings_n} rows · {excel_name}")
+        except Exception:
+            meter.clear()
+            raise
 
 
 def _run_auto(
@@ -551,73 +812,72 @@ def _run_auto(
     has_lines = bool(line_files) or bool(line_zips)
     if kind == "fire_water" or (kind == "unknown" and not has_lines):
         if kind == "unknown":
-            st.info("Could not classify the PDF confidently — trying Workflow A (single report).")
+            st.info("The report family could not be confirmed. It will be processed as a single fire water report.")
         else:
-            st.info("Detected Fire Water FVI — running Workflow A.")
+            st.info("Fire water inspection report identified. Processing under Procedure A.")
         _run_fire_water(primary_file, max_pages=max_pages, skip_images=skip_images)
         return
 
     if kind in {"process_piping_summary", "process_piping_unknown", "process_piping_line"} or has_lines:
         if not has_lines and kind == "process_piping_line":
             raise ValueError(
-                "This looks like a single Process Piping *line* PDF. "
-                "Upload the summary checklist plus all line PDFs (or a zip) under Workflow B / Auto."
+                "This document is a single process-piping line report. "
+                "Submit the summary checklist together with the line documents, or one archive."
             )
         if not has_lines:
             raise ValueError(
-                "Detected Process Piping. Upload the line-number PDFs (or a zip) "
-                "in addition to the summary, then generate again."
+                "Process piping was identified. Submit the line documents, or one archive, "
+                "together with the summary, then generate the workbook again."
             )
-        st.info("Detected Process Piping pack — running Workflow B.")
+        st.info("Process piping pack identified. Processing under Procedure B.")
         _run_edop(primary_file, line_files, line_zips, skip_images=skip_images)
         return
 
     raise ValueError(
-        "Could not detect report type. Use Workflow A for one Fire Water PDF, "
-        "or Workflow B for Process Piping summary + line PDFs."
+        "The report family could not be identified. Use Procedure A for one fire water report, "
+        "or Procedure B for a process piping summary with its line documents."
     )
 
 
-st.set_page_config(page_title="RBWS FVI Extractor", layout="wide")
+st.set_page_config(page_title="RBWS FVI Workbook Generator", layout="wide")
 
 if not _require_login():
     st.stop()
 
 if not _app_password():
     st.warning(
-        "APP_PASSWORD is not set. Anyone who can open this URL can run reports. "
-        "Set it in the environment or Streamlit secrets before sharing."
+        "Access control is not configured. Set APP_PASSWORD before this address is shared."
     )
 
 _render_chrome()
 
 def _show_run_error(exc: Exception) -> None:
     _clear_workbook()
-    st.error(f"Processing failed: {exc}")
+    st.error(f"The workbook could not be produced. {exc}")
     # Keep stack traces for unexpected bugs only.
     if not isinstance(exc, ValueError):
         st.exception(exc)
 
 
 with st.sidebar:
-    st.markdown('<p class="side-label">Job controls</p>', unsafe_allow_html=True)
+    st.markdown('<p class="side-label">Procedure</p>', unsafe_allow_html=True)
     workflow = st.radio(
-        "Select workflow",
-        options=[WORKFLOW_AUTO, WORKFLOW_FIRE_WATER, WORKFLOW_EDOP],
+        "Select procedure",
+        options=[WORKFLOW_AUTO, WORKFLOW_FIRE_WATER, WORKFLOW_EDOP, WORKFLOW_VESSEL],
         index=0,
     )
-    skip_images = st.checkbox("Omit photograph / ISO embeds", value=False)
+    skip_images = st.checkbox("Omit photographs and isometric sketches", value=False)
     max_pages = 0
     if workflow in {WORKFLOW_FIRE_WATER, WORKFLOW_AUTO}:
         max_pages = st.number_input(
-            "Page limit (0 = full document)",
+            "Page limit (0 processes the full document)",
             min_value=0,
             value=0,
             step=1,
         )
     st.markdown(
-        '<p class="side-note">Prefer <strong>Auto</strong> if you are unsure. '
-        "Uploads stay temporary for this job. Local OCR/rules only — no LLM calls.</p>",
+        '<p class="side-note">Use <strong>automatic classification</strong> when the report family is uncertain. '
+        "Source files are retained only for the duration of the job. Extraction is rules-based.</p>",
         unsafe_allow_html=True,
     )
 
@@ -627,28 +887,28 @@ if st.session_state.get("active_workflow") != workflow:
 
 if workflow == WORKFLOW_AUTO:
     st.markdown(
-        '<p class="panel-label">Auto</p>'
-        '<p class="work-title">Detect report type from the upload</p>',
+        '<p class="panel-label">Automatic classification</p>'
+        '<p class="work-title">Identify the report family from the submitted documents</p>',
         unsafe_allow_html=True,
     )
     st.info(
-        "**Fire Water:** upload one full FVI PDF.\n\n"
-        "**Process Piping:** upload the summary/checklist PDF **and** the line-number PDFs (or a zip). "
-        "We detect which pack you have and run the matching pipeline."
+        "**Fire water.** Submit one complete inspection report.\n\n"
+        "**Process piping.** Submit the summary checklist and the line documents, or one archive. "
+        "The matching procedure is selected from the documents received."
     )
     primary = st.file_uploader(
-        "Primary PDF (Fire Water report OR Process Piping summary)",
+        "Inspection report or piping summary",
         type=["pdf"],
         key="auto_primary",
     )
     line_files = st.file_uploader(
-        "Line-number PDFs (Process Piping only — multi-select)",
+        "Line documents — process piping only",
         type=["pdf"],
         accept_multiple_files=True,
         key="auto_lines",
     )
     line_zips = st.file_uploader(
-        "Or zip of line-number PDFs (Process Piping only)",
+        "Line archive — process piping only",
         type=["zip"],
         accept_multiple_files=True,
         key="auto_zips",
@@ -667,29 +927,29 @@ if workflow == WORKFLOW_AUTO:
             _show_run_error(exc)
     elif not ready:
         st.markdown(
-            '<p class="status-line"><em>Waiting</em> · Upload a PDF to begin.</p>',
+            '<p class="status-line"><em>Awaiting documents</em> · Submit a report to begin.</p>',
             unsafe_allow_html=True,
         )
 
 elif workflow == WORKFLOW_FIRE_WATER:
     st.markdown(
-        '<p class="panel-label">Workflow A</p>'
-        '<p class="work-title">Fire Water FVI — single report PDF</p>',
+        '<p class="panel-label">Procedure A</p>'
+        '<p class="work-title">Fire water full visual inspection</p>',
         unsafe_allow_html=True,
     )
     st.info(
-        "Use this for Jimcel **Fire Water** reports (example: UBIT-GP). "
-        "Upload **one** full inspection PDF."
+        "For a Jimcel **fire water** inspection report. "
+        "Submit **one** complete PDF."
     )
     uploaded = st.file_uploader(
-        "Fire Water inspection PDF",
+        "Fire water inspection report",
         type=["pdf"],
         key="fw_pdf",
-        help="Single FVI Fire Water PDF",
+        help="One complete fire water full visual inspection report",
     )
     if uploaded is not None:
         st.markdown(
-            f'<p class="status-line"><em>Loaded</em> · {_safe_pdf_name(uploaded.name)}</p>',
+            f'<p class="status-line"><em>Document received</em> · {_safe_pdf_name(uploaded.name)}</p>',
             unsafe_allow_html=True,
         )
     ready = uploaded is not None
@@ -700,47 +960,46 @@ elif workflow == WORKFLOW_FIRE_WATER:
             _show_run_error(exc)
     elif not ready:
         st.markdown(
-            '<p class="status-line"><em>Waiting</em> · Upload the Fire Water PDF, then generate.</p>',
+            '<p class="status-line"><em>Awaiting documents</em> · Submit the fire water report, then generate the workbook.</p>',
             unsafe_allow_html=True,
         )
 
-else:
+elif workflow == WORKFLOW_EDOP:
     st.markdown(
-        '<p class="panel-label">Workflow B</p>'
-        '<p class="work-title">Process Piping — summary + line-number PDFs</p>',
+        '<p class="panel-label">Procedure B</p>'
+        '<p class="work-title">Process piping full visual inspection</p>',
         unsafe_allow_html=True,
     )
     st.info(
-        "Use this for **Process Piping** packs (EDOP-QP, EAP-GN, and similar).\n\n"
-        "1. Upload the **summary / checklist** PDF (From–To line descriptions).\n"
-        "2. Upload **all line-number PDFs**, or one **.zip** of them.\n\n"
-        "If you upload a Fire Water PDF here by mistake, we will detect it and "
-        "switch to Workflow A when no line pack is present."
+        "For **process piping** packs.\n\n"
+        "1. Submit the **summary checklist**. Line descriptions are taken from the From–To text.\n"
+        "2. Submit **each line document**, or one **archive** of those documents.\n\n"
+        "A fire water report submitted here without line documents is identified and processed under Procedure A."
     )
     summary_file = st.file_uploader(
-        "1 · Summary / checklist PDF",
+        "1 · Summary checklist",
         type=["pdf"],
         key="edop_summary",
-        help="Process Piping summary / observations checklist",
+        help="Process piping summary or observations checklist",
     )
     line_files = st.file_uploader(
-        "2a · Line-number PDFs (multi-select)",
+        "2 · Line documents",
         type=["pdf"],
         accept_multiple_files=True,
         key="edop_lines",
-        help="One PDF per JV Piping List S/N (e.g. 8._AI-001-….pdf)",
+        help="One PDF for each line on the piping list",
     )
     line_zips = st.file_uploader(
-        "2b · Or zip of line-number PDFs",
+        "Or one archive of line documents",
         type=["zip"],
         accept_multiple_files=True,
         key="edop_zips",
-        help="Optional: zip containing the line PDFs",
+        help="Optional archive containing the line documents",
     )
     if summary_file is not None:
         size = getattr(summary_file, "size", None) or 0
         st.markdown(
-            f'<p class="status-line"><em>Summary</em> · {_safe_pdf_name(summary_file.name)}'
+            f'<p class="status-line"><em>Summary received</em> · {_safe_pdf_name(summary_file.name)}'
             f'{f" · {size:,} bytes" if size else ""}</p>',
             unsafe_allow_html=True,
         )
@@ -748,7 +1007,7 @@ else:
     n_zips = len(line_zips or [])
     if n_lines or n_zips:
         st.markdown(
-            f'<p class="status-line"><em>Line packs</em> · {n_lines} PDF(s)'
+            f'<p class="status-line"><em>Line documents received</em> · {n_lines} PDF(s)'
             f'{f" · {n_zips} zip(s)" if n_zips else ""}</p>',
             unsafe_allow_html=True,
         )
@@ -766,8 +1025,46 @@ else:
             _show_run_error(exc)
     elif not ready:
         st.markdown(
-            '<p class="status-line"><em>Waiting</em> · Upload the summary PDF '
-            "(and line PDFs for Process Piping).</p>",
+            '<p class="status-line"><em>Awaiting documents</em> · Submit the summary checklist. '
+            "Add the line documents for process piping.</p>",
+            unsafe_allow_html=True,
+        )
+
+elif workflow == WORKFLOW_VESSEL:
+    st.markdown(
+        '<p class="panel-label">Pressure vessel workflow</p>'
+        '<p class="work-title">Pressure vessel and tank full visual inspection</p>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "For a **pressure vessel or tank** inspection report from any facility. "
+        "Submit one report, or several. Each report is read from its summary of findings "
+        "and the equipment photographs. One equipment item is one row. "
+        "Several reports are issued as one workbook, with one sheet per report. "
+        "Probability of failure and recommendations remain blank for engineering review."
+    )
+    vessel_pdfs = st.file_uploader(
+        "Pressure vessel inspection reports",
+        type=["pdf"],
+        key="vessel_pdf",
+        accept_multiple_files=True,
+        help="One or more full visual inspection reports for pressure vessels and tanks",
+    )
+    if vessel_pdfs:
+        loaded = ", ".join(_safe_pdf_name(item.name) for item in vessel_pdfs)
+        st.markdown(
+            f'<p class="status-line"><em>Documents received</em> · {len(vessel_pdfs)} file(s) · {loaded}</p>',
+            unsafe_allow_html=True,
+        )
+    vessel_ready = bool(vessel_pdfs)
+    if st.button("Generate workbook", type="primary", disabled=not vessel_ready, key="run_vessel"):
+        try:
+            _run_vessel(vessel_pdfs, skip_images=skip_images)
+        except Exception as exc:
+            _show_run_error(exc)
+    elif not vessel_ready:
+        st.markdown(
+            '<p class="status-line"><em>Awaiting documents</em> · Submit a pressure vessel report, then generate the workbook.</p>',
             unsafe_allow_html=True,
         )
 
@@ -776,17 +1073,17 @@ if st.session_state.get("excel_token"):
     done = st.session_state.get("workflow_done", "Job")
     excel_name = st.session_state.get("excel_name", "workbook.xlsx")
     st.markdown(
-        f'<p class="status-line"><em>Complete</em> · {done} · {findings_n} rows · '
+        f'<p class="status-line"><em>Workbook ready</em> · {done} · {findings_n} rows · '
         f"{excel_name}</p>",
         unsafe_allow_html=True,
     )
     warnings = st.session_state.get("warnings") or []
     if warnings:
-        with st.expander("Extraction notes"):
+        with st.expander("Processing notes"):
             for warning in warnings:
                 st.write(f"- {warning}")
     st.link_button(
-        "Download RBWS Excel",
+        "Download workbook",
         f"/rbws-download/{st.session_state.excel_token}",
     )
 

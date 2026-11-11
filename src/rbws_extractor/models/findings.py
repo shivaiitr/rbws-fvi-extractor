@@ -18,6 +18,7 @@ class AssetClass(str, Enum):
     FIRE_WATER_MONITOR = "fire_water_monitor"
     DIESEL_STORAGE_TANK = "diesel_storage_tank"
     UNTAGGED_LINE = "untagged_line"
+    PRESSURE_VESSEL = "pressure_vessel"
     UNKNOWN = "unknown"
 
 
@@ -163,6 +164,8 @@ class ReportMetadata(BaseModel):
     pid_numbers: list[str] = Field(default_factory=list)
     inspected_by: list[str] = Field(default_factory=list)
     title: Optional[str] = None
+    # "pressure_vessel" swaps Line # / Line Description headers. Other layouts stay unchanged.
+    layout: Optional[str] = None
     source_pages: list[int] = Field(default_factory=list)
 
     @field_validator("inspection_date", mode="before")

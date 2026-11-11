@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import io
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -1264,6 +1265,7 @@ def build_edop_result(
     work_dir: Path,
     *,
     max_lines: int = 0,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> ExtractionResult:
     summary_pdf = Path(summary_pdf)
     line_pdf_dir = Path(line_pdf_dir)
@@ -1319,7 +1321,10 @@ def build_edop_result(
         sns = sns[:max_lines]
 
     findings: list[Finding] = []
-    for sn in sns:
+    total = len(sns)
+    if on_progress is not None:
+        on_progress(0, total, "Reading the summary checklist")
+    for index, sn in enumerate(sns, start=1):
         pdf_path = line_pdfs[sn]
         logger.info("Parsing line PDF SN=%s %s", sn, pdf_path.name)
         parsed = parse_line_pdf(pdf_path, work_dir / f"sn_{sn:03d}")
@@ -1373,6 +1378,8 @@ def build_edop_result(
         )
         finding.apply_judgment_blanks()
         findings.append(finding)
+        if on_progress is not None:
+            on_progress(index, total, f"Line {line_number}")
 
     # Keep JV list order (not filename lexical order after content-SN remap)
     findings.sort(key=lambda f: (f.source.table_row_index or 0, f.line_number or ""))
