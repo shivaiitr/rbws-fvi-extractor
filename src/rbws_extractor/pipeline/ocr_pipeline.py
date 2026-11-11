@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,16 @@ from rbws_extractor.ocr.crop import attach_images_from_ocr, enrich_anomaly_from_
 from rbws_extractor.pipeline.validate import validate_result
 
 logger = get_logger("pipeline.ocr")
+
+
+def _notify(
+    on_progress: Callable[[int, int, str], None] | None,
+    done: int,
+    total: int,
+    label: str,
+) -> None:
+    if on_progress is not None:
+        on_progress(done, total, label)
 
 
 class OcrPipeline:
@@ -68,6 +79,7 @@ class OcrPipeline:
         max_pages: int = 0,
         skip_images: bool = False,
         reuse_pages_dir: Path | None = None,
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> ExtractionResult:
         pdf_path = Path(pdf_path)
         output_xlsx = Path(output_xlsx)
@@ -80,6 +92,7 @@ class OcrPipeline:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("Starting OCR-only RBWS extraction for %s", pdf_path)
+        _notify(on_progress, 0, 6, "Opening the report")
 
         if reuse_pages_dir and Path(reuse_pages_dir).exists():
             src = Path(reuse_pages_dir)
@@ -90,8 +103,10 @@ class OcrPipeline:
                     shutil.copy2(png, dest)
             logger.info("Copied page renders from %s", src)
 
+        _notify(on_progress, 1, 6, "Preparing page images")
         rendered = self.engine.ensure_pages(pdf_path, pages_dir, max_pages=max_pages)
         native_dir = work_dir / "native_text"
+        _notify(on_progress, 2, 6, "Reading report text")
         texts = self.engine.extract_native_text(
             pdf_path, native_dir, max_pages=max_pages
         )
@@ -100,6 +115,7 @@ class OcrPipeline:
             texts = self.engine.ocr_pages(rendered, text_dir)
             text_source = "ocr"
 
+        _notify(on_progress, 3, 6, "Identifying observations")
         parsed = None
         if text_source == "native":
             parsed = parse_jimcel_native(texts)
@@ -110,6 +126,12 @@ class OcrPipeline:
             metadata, findings = self.parser.parse(texts)
             logger.info("Used OCR heuristic parsers")
 
+        _notify(
+            on_progress,
+            4,
+            6,
+            "Placing photographs" if not skip_images else "Photographs omitted",
+        )
         findings = enrich_anomaly_from_captions(findings, texts)
         findings = attach_images_from_ocr(
             findings,
@@ -162,7 +184,9 @@ class OcrPipeline:
             encoding="utf-8",
         )
         write_schemas(work_dir / "schemas")
+        _notify(on_progress, 5, 6, "Writing the workbook")
         self.excel_writer.write(result, output_xlsx, embed_images=not skip_images)
+        _notify(on_progress, 6, 6, "Workbook written")
 
         logger.info(
             "OCR done. findings=%s warnings=%s output=%s",
