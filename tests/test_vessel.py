@@ -19,8 +19,10 @@ from rbws_extractor.models.findings import (
 from rbws_extractor.ocr.vessel import (
     _anomaly_text,
     _field_photos,
+    _format_pit,
     _match_section,
     _parse_summary,
+    _pit_lines,
     _write_photo_with_caption,
     build_vessel_result,
     is_pressure_vessel_report,
@@ -59,9 +61,11 @@ def test_summary_tag_matches_longer_photo_tag():
     sections = [
         PhotoSection("OSO HP Gas Pig Receiver", "NGFR-MR-3395", 2, 120.0),
         PhotoSection("Flare Scrubber", "FR-D-3140", 28, 100.0),
+        PhotoSection("Cooler fan", "NGGN-DU-EM100-1", 40, 80.0),
     ]
     assert _match_section("NGFR-M-3395", sections).tag == "NGFR-MR-3395"
     assert _match_section("NGFR-D-3140", sections).tag == "FR-D-3140"
+    assert _match_section("NGGN-DU-EM100-2", sections) is None
 
 
 def test_decommissioned_summary_row_is_flagged():
@@ -117,6 +121,195 @@ In good condition
     assert [row.tag for row in rows] == ["EAP-V-1001", "YO-D-12"]
     assert rows[0].description.startswith("Test Separator")
     assert rows[1].description.startswith("Drain Vessel")
+
+
+def test_serial_stays_with_its_equipment_and_summary_description_is_kept(tmp_path: Path):
+    doc = fitz.open()
+    summary = doc.new_page()
+    summary.insert_textbox(
+        fitz.Rect(36, 36, 560, 780),
+        "\n".join(
+            [
+                "Location EAP-GN",
+                "SUMMARY OF FINDINGS",
+                "S/N",
+                "Equipment ID",
+                "4",
+                "NGFR-XLR-302",
+                "ABANG Pig Receiver",
+                "Generally observed in good condition",
+                "--",
+                "15",
+                "NGFR-G-3230",
+                "Pour Point Depressant Injection Pump",
+                "Decommissioned and out of site",
+                "--",
+            ]
+        ),
+        fontsize=11,
+    )
+    photos = doc.new_page()
+    photos.insert_text((48, 140), "Equipment ID FB Pig Receiver (NGFR-XLR-302)", fontsize=12)
+    pdf_path = tmp_path / "vessel.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    result = build_vessel_result(pdf_path, tmp_path / "work")
+    by_tag = {finding.line_number: finding for finding in result.findings}
+    assert by_tag["NGFR-XLR-302"].sn == 4
+    assert by_tag["NGFR-XLR-302"].line_description == "ABANG Pig Receiver"
+    assert by_tag["NGFR-G-3230"].sn == 15
+    assert by_tag["NGFR-G-3230"].line_description.startswith("Pour Point Depressant")
+
+
+def test_shared_photo_heading_stays_one_row(tmp_path: Path):
+    doc = fitz.open()
+    summary = doc.new_page()
+    summary.insert_textbox(
+        fitz.Rect(36, 36, 560, 780),
+        "\n".join(
+            [
+                "SUMMARY OF FINDINGS",
+                "S/N",
+                "Equipment ID",
+                "51",
+                "NGGN-DM-D048-A",
+                "Filter",
+                "Light corrosion",
+                "--",
+                "52",
+                "NGGN-DM-D048-B",
+                "Filter",
+                "Light corrosion",
+                "--",
+                "53",
+                "NGGN-DM-D099",
+                "Cooler",
+                "In good condition",
+                "--",
+            ]
+        ),
+        fontsize=11,
+    )
+    photos = doc.new_page()
+    photos.insert_text((48, 80), "Equipment ID 51 & 52 Filter (NGGN-DM-D048-A & B)", fontsize=11)
+    photos.insert_text((48, 200), "Equipment ID 53 Cooler (NGGN-DM-D099)", fontsize=11)
+    pdf_path = tmp_path / "paired.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    result = build_vessel_result(pdf_path, tmp_path / "work")
+    assert [finding.line_number for finding in result.findings] == [
+        "NGGN-DM-D048-A & NGGN-DM-D048-B",
+        "NGGN-DM-D099",
+    ]
+    assert result.findings[0].source.notes == "sn_label=51 & 52"
+    assert result.findings[1].sn == 53
+    out = tmp_path / "paired.xlsx"
+    RbwsExcelWriter().write(result, out, embed_images=False, include_pof_note=False)
+    ws = load_workbook(out).active
+    assert ws.cell(3, 2).value == "51 & 52"
+    assert ws.cell(4, 2).value == 53
+
+
+def test_report_without_a_summary_uses_the_heading_description(tmp_path: Path):
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((48, 80), "Equipment ID 51 & 52 Filter (NGGN-DM-D048-A & B)", fontsize=11)
+    page.insert_text((48, 220), "Equipment ID OSO HP Gas Pig Receiver (NGFR-MR-3395)", fontsize=11)
+    pdf_path = tmp_path / "headings_only.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    result = build_vessel_result(pdf_path, tmp_path / "work")
+    assert [finding.line_number for finding in result.findings] == [
+        "NGGN-DM-D048-A & NGGN-DM-D048-B",
+        "NGFR-MR-3395",
+    ]
+    assert result.findings[0].line_description == "Filter"
+    assert result.findings[0].source.notes == "sn_label=51 & 52"
+    assert result.findings[1].line_description == "OSO HP Gas Pig Receiver"
+    assert result.findings[1].sn == 53
+
+
+def test_pit_row_keeps_size_depth_and_remaining_wall():
+    assert _format_pit("PP1", "25.5 26.2 26.7 26.3 21.5 PP1 30 x 20 4.0") == (
+        "- PP1, size 30 x 20, max depth 4.0, UTG 25.5, 26.2, 26.7, 26.3, remaining wall 21.5"
+    )
+
+
+def test_pit_lines_read_a_measurement_page():
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((40, 120), "PIT Measurement Table For NGFR-D-3140", fontsize=11)
+    page.insert_text((400, 200), "25.5 26.2 26.7 26.3 21.5", fontsize=11)
+    page.insert_text((40, 214), "PP1 30 x 20 4.0", fontsize=11)
+    lines = _pit_lines(page)
+    doc.close()
+    assert lines
+    assert lines[0].startswith("- PP1, size 30 x 20")
+    assert "remaining wall 21.5" in lines[0]
+
+
+def test_later_summary_pages_keep_each_equipment_and_its_description(tmp_path: Path):
+    doc = fitz.open()
+    first = doc.new_page()
+    first.insert_text((72, 80), "1.0 SUMMARY OF FINDINGS", fontsize=11)
+    first.insert_text((70, 110), "S/N", fontsize=10)
+    first.insert_text((120, 110), "Equipment ID", fontsize=10)
+    first.insert_text((250, 110), "Equipment Description", fontsize=10)
+    first.insert_text((470, 110), "Anomaly Description", fontsize=10)
+    first.insert_text((560, 110), "Page #", fontsize=10)
+    first.insert_text((76, 150), "1", fontsize=10)
+    first.insert_text((120, 150), "NGGN-DM-D263", fontsize=10)
+    first.insert_text((250, 150), "Regen gas mercury removal bed", fontsize=10)
+    first.insert_text((470, 150), "Coating breakdown on top dome", fontsize=10)
+    second = doc.new_page()
+    second.insert_text((76, 90), "2", fontsize=10)
+    second.insert_text((120, 90), "NGGN-DU- EM100-2", fontsize=10)
+    second.insert_text((250, 90), "V080 STAGE 3 DISCH GAS COOLER FAN 2", fontsize=10)
+    second.insert_text((470, 90), "Wrap on electric fan motor", fontsize=10)
+    pdf_path = tmp_path / "wide_vessel.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    result = build_vessel_result(pdf_path, tmp_path / "work")
+    by_sn = {finding.sn: finding for finding in result.findings}
+    assert set(by_sn) == {1, 2}
+    assert by_sn[1].line_number == "NGGN-DM-D263"
+    assert by_sn[1].line_description == "Regen gas mercury removal bed"
+    assert by_sn[2].line_number == "NGGN-DU-EM100-2"
+    assert by_sn[2].line_description.startswith("V080 STAGE 3 DISCH")
+
+
+def test_summary_uses_the_columns_of_whatever_report_was_uploaded(tmp_path: Path):
+    doc = fitz.open()
+    first = doc.new_page()
+    first.insert_text((36, 70), "SUMMARY OF FINDINGS", fontsize=11)
+    first.insert_text((40, 100), "S/N", fontsize=10)
+    first.insert_text((90, 100), "Equipment ID", fontsize=10)
+    first.insert_text((260, 100), "Equipment Description", fontsize=10)
+    first.insert_text((430, 100), "Anomaly Description", fontsize=10)
+    first.insert_text((540, 100), "Page #", fontsize=10)
+    first.insert_text((46, 140), "1", fontsize=10)
+    first.insert_text((90, 140), "QB-T-12", fontsize=10)
+    first.insert_text((260, 140), "Inlet scrubber", fontsize=10)
+    first.insert_text((430, 140), "Light corrosion on the shell", fontsize=10)
+    second = doc.new_page()
+    second.insert_text((46, 80), "2", fontsize=10)
+    second.insert_text((90, 80), "QB-P 4A", fontsize=10)
+    second.insert_text((260, 80), "Discharge cooler", fontsize=10)
+    second.insert_text((430, 80), "Coating breakdown on the flange", fontsize=10)
+    photos = doc.new_page()
+    photos.insert_text((40, 80), "2.0 Field photographs", fontsize=12)
+    photos.insert_text((46, 140), "40", fontsize=10)
+    photos.insert_text((90, 140), "QB-T-12", fontsize=10)
+    pdf_path = tmp_path / "qb_vessel.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    result = build_vessel_result(pdf_path, tmp_path / "work")
+    by_sn = {finding.sn: finding for finding in result.findings}
+    assert set(by_sn) == {1, 2}
+    assert by_sn[1].line_number == "QB-T-12"
+    assert by_sn[1].line_description == "Inlet scrubber"
+    assert by_sn[2].line_number == "QB-P 4A"
+    assert by_sn[2].line_description == "Discharge cooler"
 
 
 def test_other_facility_pdf_builds_without_the_sample_title(tmp_path: Path):

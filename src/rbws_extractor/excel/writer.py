@@ -89,6 +89,16 @@ def _as_excel_date(value: date | datetime | None) -> datetime | None:
     return datetime(value.year, value.month, value.day)
 
 
+def _vessel_sn_label(finding: Finding) -> str | None:
+    """A shared Equipment ID heading prints every serial in the one S/N cell."""
+    notes = finding.source.notes or ""
+    match = re.search(r"(?m)^sn_label=(.+)$", notes)
+    if not match:
+        return None
+    label = match.group(1).strip()
+    return label or None
+
+
 def _finding_row_values(finding: Finding) -> list[Any]:
     return [
         finding.sn,
@@ -202,6 +212,10 @@ class RbwsExcelWriter:
         for offset, finding in enumerate(result.findings):
             row_idx = data_start + offset
             values = _finding_row_values(finding)
+            if vessel:
+                label = _vessel_sn_label(finding)
+                if label:
+                    values[0] = label
             for col_offset, value in enumerate(values):
                 cell = ws.cell(row=row_idx, column=2 + col_offset, value=value)
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
