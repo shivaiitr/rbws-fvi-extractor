@@ -222,41 +222,41 @@ def parse_summary_metadata(doc: fitz.Document) -> ReportMetadata:
 
 
 def _assemble_pid(parts: list[str]) -> str | None:
-    """Build P&ID, keeping multi-drawing suffixes like ``…0017591/92`` or ``…/96/97/99``."""
+    """Build one P&ID exactly as written for that line.
+
+    Slash suffixes stay (``…0017591/92``, ``…/96/97/99``). The discipline in
+    the name stays too: ``NGQP-MP-`` is not rewritten to ``NGQP-EP-``.
+    """
     raw = re.sub(r"\s+", "", "".join(parts)).upper()
     if not raw:
         return None
-    # Primary drawing number + optional /NN or /NNN slash suffixes from the checklist.
-    m = re.search(
-        r"(?:NGQP-EP-)?(?:PDPID-)?(\d{5,})((?:/\d{2,4})+)?",
+    match = re.search(
+        r"(?P<prefix>NGQP-[A-Z0-9]+-)?"
+        r"(?P<label>PDPID-|PDIPD-|PDPID|PDIPD)"
+        r"(?P<num>\d{4,})"
+        r"(?P<suffix>(?:/\d{2,4})*)",
         raw,
     )
-    if m:
-        suffix = m.group(2) or ""
-        return f"NGQP-EP-PDPID-{m.group(1)}{suffix}"
+    if match:
+        prefix = match.group("prefix") or "NGQP-EP-"
+        label = match.group("label")
+        if not label.endswith("-"):
+            label = f"{label}-"
+        return f"{prefix}{label}{match.group('num')}{match.group('suffix') or ''}"
     if "QP-PR" in raw:
-        m = re.search(r"(QP-PR-?\d+(?:/\d+)*)", raw)
-        if m:
-            return m.group(1)
+        match = re.search(r"(QP-PR-?\d+(?:/\d+)*)", raw)
+        if match:
+            return match.group(1)
     return raw
 
 
-def _prefer_pid(*candidates: str | None) -> str | None:
-    """Prefer the fullest P&ID (keep slash suffixes when present)."""
-    best: str | None = None
-    best_score = -1
-    for raw in candidates:
-        if not raw or not str(raw).strip():
-            continue
-        text = re.sub(r"\s+", "", str(raw)).strip()
-        # Re-normalize through assembler when it looks like a PDPID family value.
-        assembled = _assemble_pid([text]) if re.search(r"(?i)PDPID|\d{5,}", text) else text
-        value = assembled or text
-        score = len(value) + (10 if "/" in value else 0)
-        if score > best_score:
-            best = value
-            best_score = score
-    return best
+def _pid_for_line(summary_pid: str | None, line_pid: str | None) -> str | None:
+    """P&ID for this line tag. The checklist cell wins; the line PDF fills a blank."""
+    if summary_pid and str(summary_pid).strip():
+        return _assemble_pid([str(summary_pid)]) or str(summary_pid).strip()
+    if line_pid and str(line_pid).strip():
+        return _assemble_pid([str(line_pid)]) or str(line_pid).strip()
+    return None
 
 
 def parse_summary_rows(doc: fitz.Document) -> list[SummaryRow]:
@@ -1043,7 +1043,7 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
                 result.line_description = paren
         m = re.search(r"(?i)P\s*&\s*ID\s*NUMBER\s*:\s*([^\n]+)", full)
         if m:
-            result.pid_no = _prefer_pid(m.group(1).strip())
+            result.pid_no = _assemble_pid([m.group(1).strip()])
 
         m = re.search(
             r"(?is)Anomaly\s*description\s*(.+?)(?=General view|Close view|Further|"
@@ -1342,7 +1342,7 @@ def build_edop_result(
             line_description = join_from_to(summary.from_text, summary.to_text)
         if not line_description:
             line_description = parsed.line_description
-        pid_no = _prefer_pid(
+        pid_no = _pid_for_line(
             summary.pid_no if summary else None,
             parsed.pid_no,
         )
