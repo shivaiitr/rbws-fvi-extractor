@@ -685,6 +685,7 @@ def _run_edop(summary_file, line_files, line_zips, *, skip_images: bool) -> None
                     finding.photos_image_path = None
                     finding.photo_image_paths = []
                     finding.iso_image_path = None
+                    finding.iso_image_paths = []
             meter.update(94, "Writing the workbook")
             RbwsExcelWriter().write(
                 result,
@@ -732,6 +733,7 @@ def _run_vessel(uploaded, *, skip_images: bool) -> None:
                         finding.photos_image_path = None
                         finding.photo_image_paths = []
                         finding.iso_image_path = None
+                        finding.iso_image_paths = []
                 meter.update(94, "Writing the workbook")
                 RbwsExcelWriter().write(
                     result,
@@ -766,6 +768,7 @@ def _run_vessel(uploaded, *, skip_images: bool) -> None:
                             finding.photos_image_path = None
                             finding.photo_image_paths = []
                             finding.iso_image_path = None
+                            finding.iso_image_paths = []
                     writer.write(
                         result,
                         temp_dir / "vessel_RBWS.xlsx",

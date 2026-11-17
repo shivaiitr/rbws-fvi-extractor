@@ -104,6 +104,8 @@ class Finding(BaseModel):
     # Original anomaly crops, in reading order. Excel tiles these inside the cell.
     photo_image_paths: list[Path] = Field(default_factory=list)
     iso_image_path: Optional[Path] = None
+    # Every isometric sheet for this line, in page order.
+    iso_image_paths: list[Path] = Field(default_factory=list)
     recommendations: Optional[str] = None
     remarks: Optional[str] = None
     is_good_condition: bool = False
