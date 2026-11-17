@@ -103,6 +103,7 @@ class LinePdfParse:
     photo_refs: list[PhotoRef] = field(default_factory=list)
     photo_paths: list[Path] = field(default_factory=list)
     iso_path: Path | None = None
+    iso_paths: list[Path] = field(default_factory=list)
     has_photos: bool = False
     source_pdf: Path | None = None
 
@@ -372,7 +373,12 @@ _SHOT_ZOOM = 2.0
 
 
 def _classify_page(text: str) -> str:
-    """Hard-gate: mixed_page | iso_page | photo_page | other."""
+    """Hard-gate: mixed_page | iso_page | photo_page | other.
+
+    An isometric is the engineering drawing. It is marked ``LINE NUMBER:``
+    or ``Drawing not to scale``, with or without the legend stamp. A pit or
+    ultrasonic table has neither, so it is not a drawing.
+    """
     lower = text.lower()
     has_drawing = "drawing not to scale" in lower
     anomaly_views = bool(
@@ -380,32 +386,19 @@ def _classify_page(text: str) -> str:
     )
     # Parenthetical view captions — not "Ref: photo #" callouts on sketches.
     view_photo_n = len(re.findall(r"(?i)\(\s*Photo\s*#\s*\d+", text))
-    ref_photo_n = len(re.findall(r"(?i)Ref\.?\s*:?\s*photo\s*#", text))
     has_line_meta = bool(re.search(r"(?i)LINE\s*NUMBER\s*:", text))
-    has_legend = bool(
-        re.search(
-            r"(?i)pipe\s*support|weld\s*joint|flow\s*direction|corroded\s*areas",
-            text,
-        )
-    )
     has_equipment = bool(
         re.search(r"(?i)description of anomalies|equipment\s*id|anomaly description", text)
     )
-    has_iso_signal = has_drawing or (has_line_meta and ref_photo_n > 0) or (
-        has_line_meta and has_legend
-    )
+    # The sketch header uses "LINE NUMBER:". The findings form says "Line Number"
+    # on its own line, without that colon, so a photo page is not a drawing.
+    has_iso_signal = has_drawing or has_line_meta
     has_anomaly_signal = anomaly_views or view_photo_n >= 1
 
     # Anomaly photos + ISO sketch on the same page → split both ways.
-    if has_iso_signal and has_anomaly_signal:
+    if has_iso_signal and (has_anomaly_signal or has_equipment):
         return "mixed_page"
-    if has_drawing and (has_line_meta or has_legend or ref_photo_n > 0) and not anomaly_views:
-        return "iso_page"
-    if has_drawing and not anomaly_views and view_photo_n == 0:
-        return "iso_page"
-    if has_line_meta and ref_photo_n > 0 and not anomaly_views and not has_equipment:
-        return "iso_page"
-    if has_line_meta and has_legend and not anomaly_views and not has_equipment:
+    if has_iso_signal:
         return "iso_page"
     if has_anomaly_signal or has_equipment:
         return "photo_page"
@@ -464,7 +457,13 @@ def _is_field_photo_crop(img: Image.Image) -> bool:
 
 def _render_page_shot(page: fitz.Page, zoom: float = _SHOT_ZOOM) -> Image.Image:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    try:
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    finally:
+        pix = None
+        # MuPDF keeps decoded page images in a global store. Drop them per page
+        # so a long line pack does not get the process killed.
+        fitz.TOOLS.store_shrink(100)
 
 
 @dataclass
@@ -767,7 +766,7 @@ def _crop_iso_from_shot(
         y_top_frac, y_bot_frac = y_band
     else:
         y_top_frac = 0.14
-        y_bot_frac = 0.78
+        y_bot_frac = 0.92
         line_meta_y: float | None = None
         for winfo in page.get_text("words") or []:
             token = (winfo[4] or "").strip()
@@ -779,24 +778,10 @@ def _crop_iso_from_shot(
             if re.search(r"(?i)^Drawing$", token):
                 y_bot_frac = max(y_bot_frac, min(0.88, y0 + 0.08))
         if line_meta_y is not None:
-            y_top_frac = max(0.05, min(0.22, line_meta_y - 0.01))
+            y_top_frac = max(0.05, min(0.55, line_meta_y - 0.01))
 
-    # Keep large field photos out of the ISO crop.
-    for im in page.get_image_info(xrefs=True):
-        bbox = im["bbox"]
-        bw = float(bbox[2] - bbox[0])
-        bh = float(bbox[3] - bbox[1])
-        if bw < page.rect.width * 0.18 or bh < page.rect.height * 0.10:
-            continue
-        cy = ((bbox[1] + bbox[3]) / 2.0) / page_h
-        if y_top_frac <= cy <= y_bot_frac:
-            photo_bot = float(bbox[3]) / page_h
-            photo_top = float(bbox[1]) / page_h
-            if photo_bot < (y_top_frac + y_bot_frac) / 2:
-                y_top_frac = max(y_top_frac, photo_bot + 0.01)
-            else:
-                y_bot_frac = min(y_bot_frac, photo_top - 0.01)
-
+    # The drawing itself is often one large image or a vector sheet. Do not
+    # cut that out. Field photos on a mixed page are already above this band.
     y_top_frac = max(0.04, min(0.85, y_top_frac))
     y_bot_frac = max(y_top_frac + 0.12, min(0.94, y_bot_frac))
     if y_bot_frac - y_top_frac < 0.12:
@@ -1062,14 +1047,11 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
         result.photo_refs = refs
 
         stem = re.sub(r"[^\w.-]+", "_", pdf_path.stem)[:60]
-        shots_dir = work_dir / "shots"
         singles_dir = photos_dir / "singles"
-        shots_dir.mkdir(parents=True, exist_ok=True)
         singles_dir.mkdir(parents=True, exist_ok=True)
 
         paired_photos: list[PairedPhoto] = []
-        # (page_index, optional iso y_band, allow_mixed)
-        iso_jobs: list[tuple[int, tuple[float, float] | None, bool]] = []
+        iso_paths: list[Path] = []
         for i in range(doc.page_count):
             page = doc[i]
             page_text = page.get_text("text") or ""
@@ -1077,41 +1059,55 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
             if kind == "other":
                 continue
             shot = _render_page_shot(page, _SHOT_ZOOM)
-            shot_path = shots_dir / f"{stem}_p{i + 1:02d}_{kind}.png"
-            shot.save(shot_path, format="PNG", optimize=False)
-
-            if kind == "iso_page":
-                iso_jobs.append((i, None, False))
-                continue
-            if kind == "photo_page":
-                paired_photos.extend(
-                    _crop_photos_from_shot(
+            try:
+                if kind == "iso_page":
+                    rendered = _crop_iso_from_shot(
                         page,
                         shot,
-                        zoom=_SHOT_ZOOM,
-                        out_dir=singles_dir,
-                        stem=stem,
-                        page_index=i,
+                        iso_dir / f"{stem}_p{i + 1:02d}_iso.png",
                     )
-                )
-                continue
-            if kind == "mixed_page":
-                # Photos are above LINE NUMBER; ISO sketch starts at that label.
-                split = _line_split_frac(page) or 0.48
-                prep = _prepared_frac(page)
-                iso_bot = prep - 0.01 if prep and prep > split + 0.12 else 0.86
-                paired_photos.extend(
-                    _crop_photos_from_shot(
+                    if rendered is not None:
+                        iso_paths.append(rendered)
+                    continue
+                if kind == "photo_page":
+                    paired_photos.extend(
+                        _crop_photos_from_shot(
+                            page,
+                            shot,
+                            zoom=_SHOT_ZOOM,
+                            out_dir=singles_dir,
+                            stem=stem,
+                            page_index=i,
+                        )
+                    )
+                    continue
+                if kind == "mixed_page":
+                    # Photos are above LINE NUMBER; ISO sketch starts at that label.
+                    split = _line_split_frac(page) or 0.48
+                    prep = _prepared_frac(page)
+                    iso_bot = prep - 0.01 if prep and prep > split + 0.12 else 0.86
+                    paired_photos.extend(
+                        _crop_photos_from_shot(
+                            page,
+                            shot,
+                            zoom=_SHOT_ZOOM,
+                            out_dir=singles_dir,
+                            stem=stem,
+                            page_index=i,
+                            y_band=(0.08, max(0.20, split - 0.005)),
+                        )
+                    )
+                    rendered = _crop_iso_from_shot(
                         page,
                         shot,
-                        zoom=_SHOT_ZOOM,
-                        out_dir=singles_dir,
-                        stem=stem,
-                        page_index=i,
-                        y_band=(0.08, max(0.20, split - 0.005)),
+                        iso_dir / f"{stem}_p{i + 1:02d}_iso.png",
+                        y_band=(split - 0.005, iso_bot),
+                        allow_mixed=True,
                     )
-                )
-                iso_jobs.append((i, (split - 0.005, iso_bot), True))
+                    if rendered is not None:
+                        iso_paths.append(rendered)
+            finally:
+                shot.close()
 
         # Keep every anomaly photo, in page reading order. Do not drop unpaired ones.
         ordered = sorted(paired_photos, key=lambda p: p.path.name)
@@ -1151,24 +1147,9 @@ def parse_line_pdf(pdf_path: Path, work_dir: Path) -> LinePdfParse:
         # Original crops only. Excel tiles them; nothing is resized here.
         result.photo_paths = [p.path for p in ordered] if ordered else []
 
-        # Prefer dedicated iso_page, then mixed_page sketch band (no anomaly tiles).
-        pure_iso = [j for j in iso_jobs if not j[2]]
-        mixed_iso = [j for j in iso_jobs if j[2]]
-        ordered_iso = list(reversed(pure_iso)) + list(reversed(mixed_iso))
-        for page_index, iso_band, allow_mixed in ordered_iso:
-            page = doc[page_index]
-            shot = _render_page_shot(page, _SHOT_ZOOM)
-            iso_out = iso_dir / f"{stem}_iso.png"
-            rendered = _crop_iso_from_shot(
-                page,
-                shot,
-                iso_out,
-                y_band=iso_band,
-                allow_mixed=allow_mixed,
-            )
-            if rendered is not None:
-                result.iso_path = rendered
-                break
+        # Every isometric sheet on this line, in page order.
+        result.iso_paths = iso_paths
+        result.iso_path = iso_paths[0] if iso_paths else None
     finally:
         doc.close()
     return result
@@ -1182,7 +1163,7 @@ def _sn_from_filename(name: str) -> int | None:
     if not m:
         return None
     sn = int(m.group(1))
-    if not 1 <= sn <= 500:
+    if not 1 <= sn <= 5000:
         return None
     return sn
 
@@ -1220,9 +1201,20 @@ def _sn_from_pdf(path: Path) -> int | None:
             doc[i].get_text("text") or "" for i in range(min(2, doc.page_count))
         )
         m = _SN_RE.search(text)
-        if not m:
+        if m:
+            return int(m.group(1) or m.group(2))
+        # Some line sheets print the serial as its own "S/N:" line, with no
+        # "Piping List" words. The number is the next line.
+        bare = re.search(
+            r"(?im)^[ \t]*S\s*/\s*N\s*:?[ \t]*(?:\n[ \t]*)?(\d{1,4})\b",
+            text,
+        )
+        if not bare:
             return None
-        return int(m.group(1) or m.group(2))
+        sn = int(bare.group(1))
+        if not 1 <= sn <= 5000:
+            return None
+        return sn
     finally:
         doc.close()
 
@@ -1327,9 +1319,42 @@ def build_edop_result(
     for index, sn in enumerate(sns, start=1):
         pdf_path = line_pdfs[sn]
         logger.info("Parsing line PDF SN=%s %s", sn, pdf_path.name)
-        parsed = parse_line_pdf(pdf_path, work_dir / f"sn_{sn:03d}")
         summary = summary_by_sn.get(sn)
+        try:
+            parsed = parse_line_pdf(pdf_path, work_dir / f"sn_{sn:03d}")
+        except Exception as exc:
+            logger.exception("Line PDF failed SN=%s %s", sn, pdf_path.name)
+            warnings.append(f"line PDF failed: {pdf_path.name}: {exc}")
+            line_number = (
+                (summary.line_number if summary else None) or f"SN-{sn}"
+            )
+            findings.append(
+                Finding(
+                    sn=sn,
+                    asset_class=AssetClass.FIRE_WATER_PIPING,
+                    insp_date=metadata.inspection_date,
+                    line_number=line_number,
+                    line_description=(
+                        join_from_to(summary.from_text, summary.to_text)
+                        if summary
+                        else None
+                    ),
+                    anomaly_description=f"This line PDF could not be read: {exc}",
+                    pid_no=summary.pid_no if summary else None,
+                    source=FindingSource(
+                        section="edop_line_pdf",
+                        notes=str(pdf_path.name),
+                        table_row_index=sn,
+                    ),
+                ).apply_judgment_blanks()
+            )
+            if on_progress is not None:
+                on_progress(index, total, f"Line {line_number}")
+            fitz.TOOLS.store_shrink(100)
+            gc.collect()
+            continue
         # Drop peak RSS between line PDFs (Railway OOM kills otherwise).
+        fitz.TOOLS.store_shrink(100)
         gc.collect()
 
         line_number = (
@@ -1367,7 +1392,8 @@ def build_edop_result(
             photo_refs=parsed.photo_refs,
             photos_image_path=parsed.photo_paths[0] if parsed.photo_paths else None,
             photo_image_paths=list(parsed.photo_paths),
-            iso_image_path=parsed.iso_path,
+            iso_image_path=parsed.iso_paths[0] if parsed.iso_paths else None,
+            iso_image_paths=list(parsed.iso_paths),
             source=FindingSource(
                 section="edop_line_pdf",
                 pages=[],

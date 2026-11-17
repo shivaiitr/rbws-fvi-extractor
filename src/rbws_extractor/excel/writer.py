@@ -251,11 +251,18 @@ class RbwsExcelWriter:
                         max_h=fit_budget_h,
                         columns=2,
                     )
+                iso_paths = [
+                    Path(p)
+                    for p in (finding.iso_image_paths or [])
+                    if p and Path(p).exists()
+                ]
+                if not iso_paths and finding.iso_image_path:
+                    iso_paths = [Path(finding.iso_image_path)]
                 ih = self._place_images(
                     ws,
                     row_idx,
                     col=_ISO_COL,
-                    paths=[Path(finding.iso_image_path)] if finding.iso_image_path else [],
+                    paths=iso_paths,
                     max_w=iso_max_w,
                     max_h=fit_budget_h,
                     columns=1,
